@@ -65,9 +65,7 @@ enum Spacing { Paragraph, EveryLine }
 
 #[derive(Clone, Serialize, Deserialize)]
 struct SavedBook {
-    page: usize, offset: f32, font: f32, font_choice: usize,
-    background: [u8; 4], foreground: [u8; 4], spacing: Spacing,
-    strength: f32, pinned: bool,
+    page: usize, offset: f32,
     #[serde(default)]
     character: Option<usize>,
     #[serde(default)]
@@ -76,7 +74,45 @@ struct SavedBook {
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
-struct LibraryState { last: Option<PathBuf>, folder: Option<PathBuf>, books: BTreeMap<String, SavedBook> }
+struct LibraryState { last: Option<PathBuf>, folder: Option<PathBuf>, books: BTreeMap<String, SavedBook>, settings: Option<Settings>, format_version: u32 }
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct Settings {
+    font: f32, font_choice: usize, background: [u8; 4], foreground: [u8; 4],
+    spacing: Spacing, strength: f32, pinned: bool, left_margin: f32, right_margin: f32, line_spacing: f32, paragraph_gap: f32,
+}
+impl Default for Settings {
+    fn default() -> Self { Self { font: 24.0, font_choice: 2, background: [246,240,225,255], foreground: [48,43,37,255], spacing: Spacing::Paragraph, strength: 1.0, pinned: false, left_margin: 28.0, right_margin: 28.0, line_spacing: 1.45, paragraph_gap: 34.8 } }
+}
+fn settings_from_value(value: &serde_json::Value) -> Result<Settings, serde_json::Error> {
+    let mut settings: Settings = serde_json::from_value(value.clone())?;
+    if value.get("line_spacing").is_none() { settings.line_spacing = if settings.spacing == Spacing::EveryLine { 2.4 } else { 1.45 }; }
+    if value.get("paragraph_gap").is_none() { settings.paragraph_gap = if settings.spacing == Spacing::EveryLine { 0.0 } else { settings.font * settings.line_spacing }; }
+    Ok(settings)
+}
+fn load_state(bytes: &[u8]) -> Result<LibraryState, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let mut state: LibraryState = serde_json::from_value(value.clone())?;
+    if state.settings.is_none() {
+        let legacy = state.last.as_ref().and_then(|p| value.get("books")?.get(key(p)));
+        state.settings = Some(match legacy { Some(v) => settings_from_value(v)?, None => Settings::default() });
+    }
+    if let Some(v) = value.get("settings").filter(|v| !v.is_null()) { state.settings = Some(settings_from_value(v)?); }
+    if state.format_version < 2 {
+        // v0.2 display strings inserted an extra newline between paragraphs.
+        // Keep its block/pixel position instead of reusing incompatible character offsets.
+        for book in state.books.values_mut() { book.character = None; }
+    }
+    state.format_version = 2;
+    Ok(state)
+}
+fn reading_margins(width: f32, left: f32, right: f32) -> (f32, f32) {
+    let left = left.clamp(0.0, 500.0); let right = right.clamp(0.0, 500.0);
+    let budget = (width - 160.0).max(0.0);
+    let scale = if left + right > budget { budget / (left + right).max(1.0) } else { 1.0 };
+    (left * scale, right * scale)
+}
 
 fn key(path: &Path) -> String {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned()).to_string_lossy().to_lowercase()
@@ -108,12 +144,26 @@ fn move_position(page: &mut usize, offset: &mut f32, delta: f32, count: usize, m
     }
 }
 
-fn layout_page(book: &Book, page: usize, width: f32, font: f32, spacing: Spacing, ctx: &egui::Context) -> Arc<egui::Galley> {
+fn layout_page(book: &Book, page: usize, width: f32, font: f32, line_spacing: f32, paragraph_gap: f32, ctx: &egui::Context) -> Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = width;
-    let display = book.page(page).lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(if spacing == Spacing::Paragraph { "\n\n" } else { "\n" });
-    job.append(&display, 0.0, egui::TextFormat { font_id: egui::FontId::proportional(font), color: Color32::WHITE, line_height: Some(font * if spacing == Spacing::EveryLine { 2.4 } else { 1.45 }), ..Default::default() });
-    ctx.fonts(|f| f.layout_job(job))
+    let display = book.page(page).lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n");
+    job.append(&display, 0.0, egui::TextFormat { font_id: egui::FontId::proportional(font), color: Color32::WHITE, line_height: Some(font * line_spacing), ..Default::default() });
+    let mut galley = (*ctx.fonts(|f| f.layout_job(job))).clone();
+    let mut shift = 0.0;
+    let mut bounds = egui::Rect::NOTHING;
+    for row in &mut galley.rows {
+        let delta = egui::vec2(0.0, shift);
+        row.rect = row.rect.translate(delta);
+        for glyph in &mut row.glyphs { glyph.pos += delta; }
+        for vertex in &mut row.visuals.mesh.vertices { vertex.pos += delta; }
+        row.visuals.mesh_bounds = row.visuals.mesh_bounds.translate(delta);
+        bounds = bounds.union(row.visuals.mesh_bounds);
+        if row.ends_with_newline { shift += paragraph_gap; }
+    }
+    galley.rect.max.y += shift;
+    galley.mesh_bounds = bounds;
+    Arc::new(galley)
 }
 
 struct Reader {
@@ -121,6 +171,7 @@ struct Reader {
     receiver: Option<mpsc::Receiver<Result<Book, String>>>, status: String,
     search: String, matches: Vec<usize>, font: f32, font_choice: usize,
     background: Color32, foreground: Color32, spacing: Spacing, jump: usize,
+    left_margin: f32, right_margin: f32, line_spacing: f32, paragraph_gap: f32,
     offset: f32, strength: f32, pinned: bool, top_visible: bool, left_visible: bool,
     state: LibraryState, state_path: PathBuf, active_path: Option<PathBuf>, pending_path: Option<PathBuf>,
     last_save: Instant, saved_json: String, save_error: String, state_readable: bool,
@@ -142,24 +193,37 @@ impl Reader {
         cc.egui_ctx.set_style(style);
         let state_path = std::env::current_exe().unwrap_or_default().with_file_name("reader-state.json");
         let (state, save_error) = match std::fs::read(&state_path) {
-            Ok(bytes) => match serde_json::from_slice(&bytes) { Ok(s) => (s, String::new()), Err(e) => (LibraryState::default(), format!("閱讀紀錄無法解析：{e}")) },
+            Ok(bytes) => match load_state(&bytes) { Ok(s) => (s, String::new()), Err(e) => (LibraryState::default(), format!("閱讀紀錄無法解析：{e}")) },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (LibraryState::default(), String::new()),
             Err(e) => (LibraryState::default(), format!("閱讀紀錄讀取失敗：{e}")),
         };
-        let mut app = Self { files: vec![], folder: state.folder.clone().unwrap_or_else(|| BOOKS.into()), book: None, page: 0, receiver: None, status: "滑鼠移到左邊或上邊開啟功能欄，選擇小說開始閱讀".into(), search: String::new(), matches: vec![], font: 24.0, font_choice: 2, background: Color32::from_rgb(246, 240, 225), foreground: Color32::from_rgb(48, 43, 37), spacing: Spacing::Paragraph, jump: 1, offset: 0.0, strength: 1.0, pinned: false, top_visible: false, left_visible: false, state, state_path, active_path: None, pending_path: None, last_save: Instant::now(), saved_json: String::new(), state_readable: save_error.is_empty(), save_error, character: 0, row_offset: 0.0, pending_anchor: None };
+        let mut app = Self { files: vec![], folder: state.folder.clone().unwrap_or_else(|| BOOKS.into()), book: None, page: 0, receiver: None, status: "滑鼠移到左邊或上邊開啟功能欄，選擇小說開始閱讀".into(), search: String::new(), matches: vec![], font: 24.0, font_choice: 2, background: Color32::from_rgb(246, 240, 225), foreground: Color32::from_rgb(48, 43, 37), spacing: Spacing::Paragraph, jump: 1, left_margin: 28.0, right_margin: 28.0, line_spacing: 1.45, paragraph_gap: 34.8, offset: 0.0, strength: 1.0, pinned: false, top_visible: false, left_visible: false, state, state_path, active_path: None, pending_path: None, last_save: Instant::now(), saved_json: String::new(), state_readable: save_error.is_empty(), save_error, character: 0, row_offset: 0.0, pending_anchor: None };
+        app.apply_settings();
         app.refresh();
         if let Some(path) = std::env::args_os().nth(1).map(PathBuf::from).or_else(|| app.state.last.clone()) { app.open(path, cc.egui_ctx.clone()); }
         app
+    }
+
+    fn apply_settings(&mut self) {
+        let settings = self.state.settings.clone().unwrap_or_default();
+        self.font = settings.font.clamp(12.0, 96.0); self.font_choice = settings.font_choice.min(4);
+        self.background = Color32::from_rgba_unmultiplied(settings.background[0],settings.background[1],settings.background[2],settings.background[3]);
+        self.foreground = Color32::from_rgba_unmultiplied(settings.foreground[0],settings.foreground[1],settings.foreground[2],settings.foreground[3]);
+        self.spacing = settings.spacing; self.strength = settings.strength.clamp(0.2, 5.0); self.pinned = settings.pinned;
+        self.line_spacing = settings.line_spacing.clamp(1.0, 3.5); self.paragraph_gap = settings.paragraph_gap.clamp(0.0, 120.0);
+        self.left_margin = settings.left_margin.clamp(0.0, 500.0); self.right_margin = settings.right_margin.clamp(0.0, 500.0);
     }
 
     fn persist(&mut self) {
         // Do not overwrite a corrupt/unreadable state file silently.
         if !self.state_readable { return; }
         if let Some(path) = &self.active_path {
-            self.state.books.insert(key(path), SavedBook { page: self.page, offset: self.offset, font: self.font, font_choice: self.font_choice, background: self.background.to_array(), foreground: self.foreground.to_array(), spacing: self.spacing, strength: self.strength, pinned: self.pinned, character: Some(self.character), row_offset: self.row_offset });
+            self.state.books.insert(key(path), SavedBook { page: self.page, offset: self.offset, character: Some(self.character), row_offset: self.row_offset });
             self.state.last = Some(path.clone());
         }
+        self.state.settings = Some(Settings { font: self.font, font_choice: self.font_choice, background: self.background.to_array(), foreground: self.foreground.to_array(), spacing: self.spacing, strength: self.strength, pinned: self.pinned, left_margin: self.left_margin, right_margin: self.right_margin, line_spacing: self.line_spacing, paragraph_gap: self.paragraph_gap });
         self.state.folder = Some(self.folder.clone());
+        self.state.format_version = 2;
         let json = serde_json::to_string(&self.state).unwrap_or_default();
         if json != self.saved_json {
             match save_state(&self.state_path, &self.state) {
@@ -175,11 +239,7 @@ impl Reader {
         if let Some(saved) = self.active_path.as_ref().and_then(|p| self.state.books.get(&key(p))) {
             self.page = saved.page.min(self.book.as_ref().unwrap().pages.len() - 1);
             self.offset = if saved.offset.is_finite() { saved.offset.max(0.0) } else { 0.0 };
-            self.font = saved.font.clamp(12.0, 96.0); self.font_choice = saved.font_choice.min(4);
-            self.background = Color32::from_rgba_unmultiplied(saved.background[0],saved.background[1],saved.background[2],saved.background[3]);
-            self.foreground = Color32::from_rgba_unmultiplied(saved.foreground[0],saved.foreground[1],saved.foreground[2],saved.foreground[3]);
             self.pending_anchor = saved.character.map(|c| (c, saved.row_offset));
-            self.spacing = saved.spacing; self.strength = saved.strength.clamp(0.2, 5.0); self.pinned = saved.pinned;
         }
         self.jump = self.page + 1;
     }
@@ -243,7 +303,7 @@ impl eframe::App for Reader {
         let mut open = None;
         let pointer = ctx.input(|i| i.pointer.hover_pos());
         let popup = ctx.memory(|m| m.any_popup_open());
-        self.top_visible = self.pinned || popup || pointer.is_some_and(|p| p.y < if self.top_visible { 145.0 } else { 18.0 });
+        self.top_visible = self.pinned || popup || pointer.is_some_and(|p| p.y < if self.top_visible { 175.0 } else { 18.0 });
         self.left_visible = self.pinned || pointer.is_some_and(|p| p.x < if self.left_visible { 300.0 } else { 18.0 });
         if self.top_visible { egui::Window::new("settings").title_bar(false).resizable(false).fixed_pos([8.0, 8.0]).default_width(820.0).show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -269,10 +329,25 @@ impl eframe::App for Reader {
                 }
                 if ui.add(egui::DragValue::new(&mut self.font).range(12.0..=96.0).suffix(" px")).changed() { self.font_choice = 4; }
                 ui.separator(); ui.label("隔行");
-                ui.selectable_value(&mut self.spacing, Spacing::Paragraph, "按段隔行");
-                ui.selectable_value(&mut self.spacing, Spacing::EveryLine, "全部隔1行");
+                if ui.selectable_value(&mut self.spacing, Spacing::Paragraph, "按段隔行").clicked() { self.line_spacing = 1.45; self.paragraph_gap = self.font * 1.45; self.pending_anchor = Some((self.character, self.row_offset)); }
+                if ui.selectable_value(&mut self.spacing, Spacing::EveryLine, "全部隔1行").clicked() { self.line_spacing = 2.4; self.paragraph_gap = 0.0; self.pending_anchor = Some((self.character, self.row_offset)); }
                 ui.label("捲動強度");
                 ui.add(egui::DragValue::new(&mut self.strength).range(0.2..=5.0).speed(0.1).suffix(" ×"));
+            });
+            ui.horizontal(|ui| {
+                ui.label("行距");
+                let line = ui.add(egui::DragValue::new(&mut self.line_spacing).range(1.0..=3.5).speed(0.05).suffix(" 倍")).changed();
+                ui.label("段落間距");
+                let paragraph = ui.add(egui::DragValue::new(&mut self.paragraph_gap).range(0.0..=120.0).speed(1.0).suffix(" px")).changed();
+                if line || paragraph { self.pending_anchor = Some((self.character, self.row_offset)); }
+            });
+            ui.horizontal(|ui| {
+                ui.label("全域 · 左留白");
+                let left = ui.add(egui::DragValue::new(&mut self.left_margin).range(0.0..=500.0).speed(2.0).suffix(" px")).changed();
+                ui.label("右留白");
+                let right = ui.add(egui::DragValue::new(&mut self.right_margin).range(0.0..=500.0).speed(2.0).suffix(" px")).changed();
+                if left || right { self.pending_anchor = Some((self.character, self.row_offset)); }
+                ui.small("所有書共用設定；窄視窗自動縮小留白");
             });
         }); }
         egui::TopBottomPanel::bottom("navigation").show(ctx, |ui| {
@@ -294,7 +369,7 @@ impl eframe::App for Reader {
                 if !self.save_error.is_empty() { ui.colored_label(Color32::RED, &self.save_error); }
             });
         });
-        if self.left_visible { egui::Window::new("library").title_bar(false).fixed_pos([8.0, 150.0]).fixed_size([270.0, (ctx.screen_rect().height()-220.0).max(200.0)]).resizable(false).show(ctx, |ui| {
+        if self.left_visible { egui::Window::new("library").title_bar(false).fixed_pos([8.0, 185.0]).fixed_size([270.0, (ctx.screen_rect().height()-255.0).max(200.0)]).resizable(false).show(ctx, |ui| {
             ui.heading("書架");
             ui.small(self.folder.to_string_lossy());
             egui::ScrollArea::vertical().id_salt("books").max_height(160.0).show_rows(ui, 25.0, self.files.len(), |ui, range| {
@@ -313,15 +388,18 @@ impl eframe::App for Reader {
                 });
             }
         }); }
-        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(self.background).inner_margin(28.0)).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(self.background).inner_margin(0.0)).show(ctx, |ui| {
             let mut rect = ui.available_rect_before_wrap();
-            if self.pinned { rect.min.x += 285.0; rect.min.y += 140.0; }
+            rect.min.y += 28.0; rect.max.y -= 28.0;
+            if self.pinned { rect.min.x += 285.0; rect.min.y += 175.0; }
+            let (left, right) = reading_margins(rect.width(), self.left_margin, self.right_margin);
+            rect.min.x += left; rect.max.x -= right;
             if let Some(book) = &self.book {
                 ui.painter().text(rect.min, egui::Align2::LEFT_TOP, &book.name, egui::FontId::proportional(16.0), self.foreground);
                 rect.min.y += 30.0;
-                let width = rect.width().min(1100.0).max(80.0);
+                let width = rect.width().max(80.0);
                 let mut cache = BTreeMap::new();
-                let mut get = |page| cache.entry(page).or_insert_with(|| layout_page(book, page, width, self.font, self.spacing, ctx)).clone();
+                let mut get = |page| cache.entry(page).or_insert_with(|| layout_page(book, page, width, self.font, self.line_spacing, self.paragraph_gap, ctx)).clone();
                 let hovered = pointer.is_some_and(|p| rect.contains(p)) && ctx.layer_id_at(pointer.unwrap_or_default()) == Some(ui.layer_id());
                 let delta = if hovered { -ctx.input(|i| i.smooth_scroll_delta.y) * self.strength } else { 0.0 };
                 if let Some((character, row_offset)) = self.pending_anchor.take() {
@@ -329,7 +407,7 @@ impl eframe::App for Reader {
                     let cursor = galley.from_ccursor(egui::text::CCursor::new(character));
                     self.offset = (galley.pos_from_cursor(&cursor).top() + row_offset).max(0.0);
                 }
-                move_position(&mut self.page, &mut self.offset, delta, book.pages.len(), |p| get(p).size().y + self.font * 0.6);
+                move_position(&mut self.page, &mut self.offset, delta, book.pages.len(), |p| get(p).size().y.max(self.font * self.line_spacing) + if book.page(p).ends_with('\n') { self.paragraph_gap } else { 0.0 });
                 // Near EOF, keep the final line visible without an empty screen.
                 if self.page + 1 == book.pages.len() {
                     self.offset = self.offset.min((get(self.page).size().y - rect.height()).max(0.0));
@@ -344,7 +422,7 @@ impl eframe::App for Reader {
                 while y < rect.bottom() && page < book.pages.len() {
                     let galley = get(page);
                     painter.galley_with_override_text_color(egui::pos2(rect.left(), y), galley.clone(), self.foreground);
-                    y += galley.size().y + self.font * 0.6;
+                    y += galley.size().y.max(self.font * self.line_spacing) + if book.page(page).ends_with('\n') { self.paragraph_gap } else { 0.0 };
                     page += 1;
                 }
                 ui.allocate_rect(rect, egui::Sense::hover());
@@ -365,6 +443,48 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn line_and_paragraph_spacing_are_independent_and_cursor_geometry_matches() {
+        let b = index("第一段文字\n第二段文字\n第三段文字".into(), "test".into());
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let normal = layout_page(&b, 0, 600.0, 24.0, 1.5, 0.0, ctx);
+            let paragraphs = layout_page(&b, 0, 600.0, 24.0, 1.5, 20.0, ctx);
+            let lines = layout_page(&b, 0, 600.0, 24.0, 2.5, 0.0, ctx);
+            assert_eq!(normal.rows.len(), 3);
+            assert!((paragraphs.rows[1].rect.top() - normal.rows[1].rect.top() - 20.0).abs() < 0.01);
+            assert!((paragraphs.size().y - normal.size().y - 40.0).abs() < 0.01);
+            assert!(lines.size().y > normal.size().y);
+            let cursor = paragraphs.cursor_from_pos(egui::vec2(0.0, paragraphs.rows[1].rect.center().y));
+            assert!((paragraphs.pos_from_cursor(&cursor).top() - paragraphs.rows[1].rect.top()).abs() < 0.01);
+        });
+    }
+    #[test]
+    fn legacy_last_book_migrates_to_global_and_new_global_takes_precedence() {
+        let path = PathBuf::from("legacy-book.txt");
+        let mut books = serde_json::Map::new();
+        books.insert(key(&path), serde_json::json!({"page":12,"offset":45.0,"font":40.0,"font_choice":0,"background":[1,2,3,255],"foreground":[200,201,202,255],"spacing":"EveryLine","strength":2.0,"pinned":true}));
+        let mut value = serde_json::json!({"last":path,"books":books});
+        let state = load_state(&serde_json::to_vec(&value).unwrap()).unwrap();
+        let settings = state.settings.unwrap();
+        assert_eq!(settings.font, 40.0);
+        assert_eq!(settings.left_margin, 28.0);
+        assert_eq!(state.books[&key(&path)].page, 12);
+        value["settings"] = serde_json::json!({"font":18.0,"left_margin":130.0,"right_margin":210.0});
+        let state = load_state(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(state.settings.as_ref().unwrap().font, 18.0);
+        let serialized = serde_json::to_value(state).unwrap();
+        assert!(serialized["books"][key(&path)].get("font").is_none());
+    }
+
+    #[test]
+    fn independent_margins_preserve_readable_width() {
+        assert_eq!(reading_margins(1000.0, 100.0, 200.0), (100.0, 200.0));
+        let (left, right) = reading_margins(400.0, 200.0, 400.0);
+        assert!((left - 80.0).abs() < 0.01);
+        assert!((right - 160.0).abs() < 0.01);
+        assert_eq!(reading_margins(100.0, 500.0, 500.0), (0.0, 0.0));
+    }
     #[test]
     fn unicode_pages_reconstruct_source_and_chapters_keep_original_order() {
         let source = format!("前言\n介紹\n第十二章 測試\n{}\n第2章 重設章號\n終章\n完結", "中文🙂".repeat(4000));
@@ -400,14 +520,15 @@ mod tests {
     }
 
     #[test]
-    fn per_book_settings_and_position_survive_atomic_replacement() {
+    fn global_settings_and_separate_positions_survive_atomic_replacement() {
         let folder = PathBuf::from("verification/reader-state-test");
         std::fs::create_dir_all(&folder).unwrap();
         let path = folder.join("state.json");
         let mut state = LibraryState::default();
-        let saved = SavedBook { page: 51, offset: 325.5, font: 40.0, font_choice: 0, background: [10,20,30,255], foreground: [220,221,222,255], spacing: Spacing::EveryLine, strength: 2.5, pinned: true, character: Some(120), row_offset: 3.0 };
+        let saved = SavedBook { page: 51, offset: 325.5, character: Some(120), row_offset: 3.0 };
         state.books.insert("first".into(), saved.clone());
-        state.books.insert("second".into(), SavedBook { page: 2, font: 18.0, ..saved });
+        state.books.insert("second".into(), SavedBook { page: 2, ..saved });
+        state.settings = Some(Settings { font: 40.0, left_margin: 100.0, right_margin: 200.0, ..Settings::default() });
         state.last = Some("second.txt".into());
         save_state(&path, &state).unwrap();
         state.books.get_mut("first").unwrap().offset = 400.0;
@@ -415,7 +536,8 @@ mod tests {
         let loaded: LibraryState = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(serde_json::to_string(&loaded).unwrap(), serde_json::to_string(&state).unwrap());
         assert_eq!(loaded.books["first"].offset, 400.0);
-        assert_eq!(loaded.books["second"].font, 18.0);
+        assert_eq!(loaded.books["second"].page, 2);
+        assert_eq!(loaded.settings.unwrap().right_margin, 200.0);
     }
 
     #[test]
@@ -426,16 +548,16 @@ mod tests {
             let chapter = b.chapters.iter().find(|c| c.title.starts_with("第26章")).unwrap();
             let mut page = chapter.page;
             let mut offset = 0.0;
-            let height = |p| layout_page(&b, p, 600.0, 24.0, Spacing::Paragraph, ctx).size().y + 14.4;
+            let height = |p| layout_page(&b, p, 600.0, 24.0, 1.45, 34.8, ctx).size().y + 14.4;
             move_position(&mut page, &mut offset, -80.0, b.pages.len(), height);
             assert_eq!(page, chapter.page - 1);
             assert!((offset - (height(page) - 80.0)).abs() < 0.1);
             move_position(&mut page, &mut offset, 100.0, b.pages.len(), height);
             assert_eq!(page, chapter.page);
             assert!((offset - 20.0).abs() < 0.1);
-            let original = layout_page(&b, page, 600.0, 24.0, Spacing::Paragraph, ctx);
+            let original = layout_page(&b, page, 600.0, 24.0, 1.45, 34.8, ctx);
             let anchor = original.cursor_from_pos(egui::vec2(0.0, 150.0));
-            let narrow = layout_page(&b, page, 300.0, 24.0, Spacing::Paragraph, ctx);
+            let narrow = layout_page(&b, page, 300.0, 24.0, 1.45, 34.8, ctx);
             let restored = narrow.from_ccursor(anchor.ccursor);
             assert_eq!(restored.ccursor.index, anchor.ccursor.index);
             assert!(narrow.pos_from_cursor(&restored).top().is_finite());
