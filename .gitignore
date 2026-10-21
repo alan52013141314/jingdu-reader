@@ -1,0 +1,8 @@
+/target/
+/verification/
+/dist/
+reader-state.json*
+*.exe
+*.pdb
+/books/
+*.txt
