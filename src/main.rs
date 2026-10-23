@@ -9,7 +9,7 @@ const BOOKS: &str = "C:/Cursor/Project/noveltest/books";
 const PAGE_CHARS: usize = 2400;
 
 struct Chapter { title: String, page: usize }
-struct Book { text: String, pages: Vec<usize>, chapters: Vec<Chapter>, name: String, seconds: f64 }
+struct Book { text: String, pages: Vec<usize>, chapters: Vec<Chapter>, name: String, seconds: f64, word_prefix: Vec<usize> }
 
 fn decode(bytes: Vec<u8>) -> Result<String, String> {
     if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]) {
@@ -53,10 +53,27 @@ fn index(text: String, name: String) -> Book {
         offset += line.len();
     }
     if chapters.first().map_or(true, |c| c.page != 0) { chapters.insert(0, Chapter { title: "開頭／前言".into(), page: 0 }); }
-    Book { text, pages, chapters, name, seconds: 0.0 }
+    let mut word_prefix = vec![0];
+    for (i, start) in pages.iter().enumerate() {
+        let end = pages.get(i + 1).copied().unwrap_or(text.len());
+        word_prefix.push(word_prefix.last().unwrap() + text[*start..end].chars().filter(|c| !c.is_whitespace()).count());
+    }
+    Book { text, pages, chapters, name, seconds: 0.0, word_prefix }
 }
 
+fn display_text(text: &str) -> String {
+    text.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n")
+}
 impl Book {
+    fn title_at(&self, page: usize) -> String {
+        let chapter = self.chapters.partition_point(|c| c.page <= page).saturating_sub(1);
+        format!("{}({})", self.name, self.chapters[chapter].title)
+    }
+    fn read_count(&self, page: usize, character: usize) -> usize {
+        self.word_prefix[page] + display_text(self.page(page)).chars().take(character).filter(|c| !c.is_whitespace()).count()
+    }
+    fn total_count(&self) -> usize { *self.word_prefix.last().unwrap() }
+
     fn page(&self, n: usize) -> &str { &self.text[self.pages[n]..self.pages.get(n + 1).copied().unwrap_or(self.text.len())] }
 }
 
@@ -80,10 +97,10 @@ struct LibraryState { last: Option<PathBuf>, folder: Option<PathBuf>, books: BTr
 #[serde(default)]
 struct Settings {
     font: f32, font_choice: usize, background: [u8; 4], foreground: [u8; 4],
-    spacing: Spacing, strength: f32, pinned: bool, left_margin: f32, right_margin: f32, line_spacing: f32, paragraph_gap: f32,
+    spacing: Spacing, strength: f32, pinned: bool, left_margin: f32, right_margin: f32, line_spacing: f32, paragraph_gap: f32, no_margins: bool,
 }
 impl Default for Settings {
-    fn default() -> Self { Self { font: 24.0, font_choice: 2, background: [246,240,225,255], foreground: [48,43,37,255], spacing: Spacing::Paragraph, strength: 1.0, pinned: false, left_margin: 28.0, right_margin: 28.0, line_spacing: 1.45, paragraph_gap: 34.8 } }
+    fn default() -> Self { Self { font: 24.0, font_choice: 2, background: [246,240,225,255], foreground: [48,43,37,255], spacing: Spacing::Paragraph, strength: 1.0, pinned: false, left_margin: 28.0, right_margin: 28.0, line_spacing: 1.45, paragraph_gap: 34.8, no_margins: false } }
 }
 fn settings_from_value(value: &serde_json::Value) -> Result<Settings, serde_json::Error> {
     let mut settings: Settings = serde_json::from_value(value.clone())?;
@@ -147,7 +164,7 @@ fn move_position(page: &mut usize, offset: &mut f32, delta: f32, count: usize, m
 fn layout_page(book: &Book, page: usize, width: f32, font: f32, line_spacing: f32, paragraph_gap: f32, ctx: &egui::Context) -> Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = width;
-    let display = book.page(page).lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n");
+    let display = display_text(book.page(page));
     job.append(&display, 0.0, egui::TextFormat { font_id: egui::FontId::proportional(font), color: Color32::WHITE, line_height: Some(font * line_spacing), ..Default::default() });
     let mut galley = (*ctx.fonts(|f| f.layout_job(job))).clone();
     let mut shift = 0.0;
@@ -171,7 +188,7 @@ struct Reader {
     receiver: Option<mpsc::Receiver<Result<Book, String>>>, status: String,
     search: String, matches: Vec<usize>, font: f32, font_choice: usize,
     background: Color32, foreground: Color32, spacing: Spacing, jump: usize,
-    left_margin: f32, right_margin: f32, line_spacing: f32, paragraph_gap: f32,
+    left_margin: f32, right_margin: f32, line_spacing: f32, paragraph_gap: f32, no_margins: bool, read_chars: usize,
     offset: f32, strength: f32, pinned: bool, top_visible: bool, left_visible: bool,
     state: LibraryState, state_path: PathBuf, active_path: Option<PathBuf>, pending_path: Option<PathBuf>,
     last_save: Instant, saved_json: String, save_error: String, state_readable: bool,
@@ -197,7 +214,7 @@ impl Reader {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (LibraryState::default(), String::new()),
             Err(e) => (LibraryState::default(), format!("閱讀紀錄讀取失敗：{e}")),
         };
-        let mut app = Self { files: vec![], folder: state.folder.clone().unwrap_or_else(|| BOOKS.into()), book: None, page: 0, receiver: None, status: "滑鼠移到左邊或上邊開啟功能欄，選擇小說開始閱讀".into(), search: String::new(), matches: vec![], font: 24.0, font_choice: 2, background: Color32::from_rgb(246, 240, 225), foreground: Color32::from_rgb(48, 43, 37), spacing: Spacing::Paragraph, jump: 1, left_margin: 28.0, right_margin: 28.0, line_spacing: 1.45, paragraph_gap: 34.8, offset: 0.0, strength: 1.0, pinned: false, top_visible: false, left_visible: false, state, state_path, active_path: None, pending_path: None, last_save: Instant::now(), saved_json: String::new(), state_readable: save_error.is_empty(), save_error, character: 0, row_offset: 0.0, pending_anchor: None };
+        let mut app = Self { files: vec![], folder: state.folder.clone().unwrap_or_else(|| BOOKS.into()), book: None, page: 0, receiver: None, status: "滑鼠移到左邊或上邊開啟功能欄，選擇小說開始閱讀".into(), search: String::new(), matches: vec![], font: 24.0, font_choice: 2, background: Color32::from_rgb(246, 240, 225), foreground: Color32::from_rgb(48, 43, 37), spacing: Spacing::Paragraph, jump: 1, left_margin: 28.0, right_margin: 28.0, line_spacing: 1.45, paragraph_gap: 34.8, no_margins: false, read_chars: 0, offset: 0.0, strength: 1.0, pinned: false, top_visible: false, left_visible: false, state, state_path, active_path: None, pending_path: None, last_save: Instant::now(), saved_json: String::new(), state_readable: save_error.is_empty(), save_error, character: 0, row_offset: 0.0, pending_anchor: None };
         app.apply_settings();
         app.refresh();
         if let Some(path) = std::env::args_os().nth(1).map(PathBuf::from).or_else(|| app.state.last.clone()) { app.open(path, cc.egui_ctx.clone()); }
@@ -210,6 +227,7 @@ impl Reader {
         self.background = Color32::from_rgba_unmultiplied(settings.background[0],settings.background[1],settings.background[2],settings.background[3]);
         self.foreground = Color32::from_rgba_unmultiplied(settings.foreground[0],settings.foreground[1],settings.foreground[2],settings.foreground[3]);
         self.spacing = settings.spacing; self.strength = settings.strength.clamp(0.2, 5.0); self.pinned = settings.pinned;
+        self.no_margins = settings.no_margins;
         self.line_spacing = settings.line_spacing.clamp(1.0, 3.5); self.paragraph_gap = settings.paragraph_gap.clamp(0.0, 120.0);
         self.left_margin = settings.left_margin.clamp(0.0, 500.0); self.right_margin = settings.right_margin.clamp(0.0, 500.0);
     }
@@ -221,7 +239,7 @@ impl Reader {
             self.state.books.insert(key(path), SavedBook { page: self.page, offset: self.offset, character: Some(self.character), row_offset: self.row_offset });
             self.state.last = Some(path.clone());
         }
-        self.state.settings = Some(Settings { font: self.font, font_choice: self.font_choice, background: self.background.to_array(), foreground: self.foreground.to_array(), spacing: self.spacing, strength: self.strength, pinned: self.pinned, left_margin: self.left_margin, right_margin: self.right_margin, line_spacing: self.line_spacing, paragraph_gap: self.paragraph_gap });
+        self.state.settings = Some(Settings { font: self.font, font_choice: self.font_choice, background: self.background.to_array(), foreground: self.foreground.to_array(), spacing: self.spacing, strength: self.strength, pinned: self.pinned, left_margin: self.left_margin, right_margin: self.right_margin, line_spacing: self.line_spacing, paragraph_gap: self.paragraph_gap, no_margins: self.no_margins });
         self.state.folder = Some(self.folder.clone());
         self.state.format_version = 2;
         let json = serde_json::to_string(&self.state).unwrap_or_default();
@@ -235,7 +253,7 @@ impl Reader {
     }
 
     fn restore(&mut self) {
-        self.page = 0; self.offset = 0.0; self.pending_anchor = None;
+        self.page = 0; self.offset = 0.0; self.read_chars = 0; self.pending_anchor = None;
         if let Some(saved) = self.active_path.as_ref().and_then(|p| self.state.books.get(&key(p))) {
             self.page = saved.page.min(self.book.as_ref().unwrap().pages.len() - 1);
             self.offset = if saved.offset.is_finite() { saved.offset.max(0.0) } else { 0.0 };
@@ -347,7 +365,7 @@ impl eframe::App for Reader {
                 ui.label("右留白");
                 let right = ui.add(egui::DragValue::new(&mut self.right_margin).range(0.0..=500.0).speed(2.0).suffix(" px")).changed();
                 if left || right { self.pending_anchor = Some((self.character, self.row_offset)); }
-                ui.small("所有書共用設定；窄視窗自動縮小留白");
+                if ui.checkbox(&mut self.no_margins, "不留白").on_hover_text("覆蓋左右留白；取消後恢復原設定").changed() { self.pending_anchor = Some((self.character, self.row_offset)); }
             });
         }); }
         egui::TopBottomPanel::bottom("navigation").show(ctx, |ui| {
@@ -357,6 +375,9 @@ impl eframe::App for Reader {
                     if ui.add_enabled(self.page > 0, egui::Button::new("◀ 上一頁")).clicked() { self.page -= 1; self.offset = 0.0; }
                     if ui.add_enabled(self.page + 1 < total, egui::Button::new("下一頁 ▶")).clicked() { self.page += 1; self.offset = 0.0; }
                     ui.label(format!("第 {} / {} 頁", self.page + 1, total));
+                    let count = book.total_count();
+                    let read = self.read_chars.min(count);
+                    ui.label(format!("已讀 {read} / {count} 字 · {:.2}%", if count == 0 { 0.0 } else { read as f64 * 100.0 / count as f64 })).on_hover_text("截至畫面底部的閱讀位置；含標點，不計空白。向上捲動時進度也會回退。");
                     ui.add(egui::DragValue::new(&mut self.jump).range(1..=total));
                     if ui.button("跳頁").clicked() { self.page = self.jump.saturating_sub(1).min(total - 1); self.offset = 0.0; }
                     if !ctx.wants_keyboard_input() {
@@ -391,11 +412,11 @@ impl eframe::App for Reader {
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(self.background).inner_margin(0.0)).show(ctx, |ui| {
             let mut rect = ui.available_rect_before_wrap();
             rect.min.y += 28.0; rect.max.y -= 28.0;
-            if self.pinned { rect.min.x += 285.0; rect.min.y += 175.0; }
-            let (left, right) = reading_margins(rect.width(), self.left_margin, self.right_margin);
+            if self.pinned { rect.min.x += 300.0; rect.min.y += 175.0; }
+            let (left, right) = reading_margins(rect.width(), if self.no_margins { 0.0 } else { self.left_margin }, if self.no_margins { 0.0 } else { self.right_margin });
             rect.min.x += left; rect.max.x -= right;
             if let Some(book) = &self.book {
-                ui.painter().text(rect.min, egui::Align2::LEFT_TOP, &book.name, egui::FontId::proportional(16.0), self.foreground);
+                let title_pos = rect.min;
                 rect.min.y += 30.0;
                 let width = rect.width().max(80.0);
                 let mut cache = BTreeMap::new();
@@ -412,6 +433,7 @@ impl eframe::App for Reader {
                 if self.page + 1 == book.pages.len() {
                     self.offset = self.offset.min((get(self.page).size().y - rect.height()).max(0.0));
                 }
+                ui.painter().with_clip_rect(ui.max_rect()).text(title_pos, egui::Align2::LEFT_TOP, book.title_at(self.page), egui::FontId::proportional(16.0), self.foreground);
                 let top = get(self.page);
                 let cursor = top.cursor_from_pos(egui::vec2(0.0, self.offset));
                 self.character = cursor.ccursor.index;
@@ -419,12 +441,16 @@ impl eframe::App for Reader {
                 let painter = ui.painter().with_clip_rect(rect);
                 let mut y = rect.top() - self.offset;
                 let mut page = self.page;
+                let mut read = book.word_prefix[page];
                 while y < rect.bottom() && page < book.pages.len() {
                     let galley = get(page);
+                    let end = galley.cursor_from_pos(egui::vec2(width, rect.bottom() - y));
+                    read = book.read_count(page, end.ccursor.index);
                     painter.galley_with_override_text_color(egui::pos2(rect.left(), y), galley.clone(), self.foreground);
                     y += galley.size().y.max(self.font * self.line_spacing) + if book.page(page).ends_with('\n') { self.paragraph_gap } else { 0.0 };
                     page += 1;
                 }
+                if read != self.read_chars { self.read_chars = read; ctx.request_repaint(); }
                 ui.allocate_rect(rect, egui::Sense::hover());
             } else {
                 ui.painter().text(rect.min, egui::Align2::LEFT_TOP, &self.status, egui::FontId::proportional(22.0), self.foreground);
@@ -437,12 +463,34 @@ impl eframe::App for Reader {
 }
 
 fn main() -> eframe::Result {
-    eframe::run_native("靜讀 · 大型 TXT 小說閱讀器", eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_inner_size([1250.0, 900.0]).with_min_inner_size([850.0, 600.0]), ..Default::default() }, Box::new(|cc| Ok(Box::new(Reader::new(cc)))))
+    eframe::run_native("靜讀 · 大型 TXT 小說閱讀器", eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).expect("embedded icon")).with_inner_size([1250.0, 900.0]).with_min_inner_size([850.0, 600.0]), ..Default::default() }, Box::new(|cc| Ok(Box::new(Reader::new(cc)))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn chapter_title_and_unicode_reading_counts_follow_source_order() {
+        let book = index("第1章 A\n  中文🙂。 \n\n第2章 B\n終點！".into(), "abc.txt".into());
+        assert_eq!(book.title_at(0), "abc.txt(第1章 A)");
+        assert_eq!(book.title_at(1), "abc.txt(第2章 B)");
+        assert_eq!(book.total_count(), book.text.chars().filter(|c| !c.is_whitespace()).count());
+        assert_eq!(book.read_count(0, 0), 0);
+        assert_eq!(book.read_count(0, usize::MAX), book.word_prefix[1]);
+        assert_eq!(book.read_count(1, usize::MAX), book.total_count());
+        assert_eq!(index(String::new(), "empty".into()).total_count(), 0);
+    }
+
+    #[test]
+    fn icon_and_global_margin_override_are_valid_and_persisted() {
+        let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).unwrap();
+        assert_eq!((icon.width, icon.height, icon.rgba.len()), (256, 256, 256 * 256 * 4));
+        let settings = Settings { no_margins: true, left_margin: 123.0, right_margin: 234.0, ..Settings::default() };
+        let restored: Settings = serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert!(restored.no_margins);
+        assert_eq!((restored.left_margin, restored.right_margin), (123.0, 234.0));
+        assert!(!serde_json::from_str::<Settings>("{}").unwrap().no_margins);
+    }
     #[test]
     fn line_and_paragraph_spacing_are_independent_and_cursor_geometry_matches() {
         let b = index("第一段文字\n第二段文字\n第三段文字".into(), "test".into());
