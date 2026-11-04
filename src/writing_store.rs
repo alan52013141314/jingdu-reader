@@ -19,11 +19,11 @@ pub fn split(text: &str) -> Chunks {
     result
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum Encoding { #[default] Utf8, Utf8Bom, Utf16Le, Utf16Be }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct Snapshot { pub chunks: Vec<String>, pub page: usize, pub encoding: Encoding }
+pub struct Snapshot { #[serde(default)] pub content_hash: String, pub chunks: Vec<String>, pub page: usize, pub encoding: Encoding }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Version { pub id: u64, pub time: u64, pub reason: String, pub snapshot: Snapshot }
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -33,7 +33,7 @@ pub struct History { pub versions: Vec<Version>, pub draft: Option<Snapshot>, pu
 pub struct Document {
     pub path: PathBuf, pub store: PathBuf, pub chunks: Chunks, pub page: usize,
     pub encoding: Encoding, pub revision: u64, pub drafted_revision: u64, pub dirty: bool,
-    pub history: History, pub history_bytes: u64,
+    pub history: History, pub history_bytes: u64, pub version_skipped: bool,
     // Exclusive document lock is retained by all in-flight snapshots too.
     pub _lock: Arc<File>,
 }
@@ -74,7 +74,8 @@ fn snapshot(doc: &Document) -> Result<Snapshot> {
         }
         ids.push(id);
     }
-    Ok(Snapshot { chunks: ids, page: doc.page, encoding: doc.encoding })
+    let mut digest=Sha256::new();for chunk in &doc.chunks {digest.update(chunk.as_bytes());}
+    Ok(Snapshot { content_hash: format!("{:x}",digest.finalize()), chunks: ids, page: doc.page, encoding: doc.encoding })
 }
 fn used(history: &History, draft: bool) -> BTreeSet<String> {
     let mut ids: BTreeSet<_> = history.versions.iter().flat_map(|v| v.snapshot.chunks.iter().cloned()).collect();
@@ -119,7 +120,7 @@ pub fn open(root: &Path, path: PathBuf, create: bool) -> Result<Document> {
         (split(&crate::decode(bytes)?), encoding, 0, false)
     };
     let page = page.min(chunks.len().saturating_sub(1));
-    Ok(Document { path, history_bytes: history_bytes(&store, &history), store, chunks, page, encoding, revision: 0, drafted_revision: 0, dirty, history, _lock: lock })
+    Ok(Document { path, version_skipped: false, history_bytes: history_bytes(&store, &history), store, chunks, page, encoding, revision: 0, drafted_revision: 0, dirty, history, _lock: lock })
 }
 fn write_original(doc: &Document) -> Result<()> {
     atomic(&doc.path, |file| {
@@ -140,13 +141,28 @@ fn write_original(doc: &Document) -> Result<()> {
 pub fn save(mut doc: Document, reason: Option<&str>) -> Result<Document> {
     // Retry after a partial failure must retain any history already committed on disk.
     if let Ok(bytes) = fs::read(doc.store.join("history.json")) { doc.history = serde_json::from_slice(&bytes).map_err(|e|format!("版本紀錄無法讀取：{e}"))?; }
+    doc.version_skipped=false;
     let snap = snapshot(&doc)?;
     // First persist a recovery draft, so a failure after replacing the TXT remains recoverable.
     doc.history.draft = Some(snap.clone()); save_history(&doc.store, &doc.history)?;
     if let Some(reason) = reason {
         write_original(&doc)?;
+        let mut repeats=0;
+        for version in doc.history.versions.iter().rev().take(2) {
+            let previous=&version.snapshot;
+            let identical=previous.encoding==snap.encoding && if previous.content_hash.is_empty() {
+                if previous.chunks==snap.chunks {true} else {
+                    let mut digest=Sha256::new();for chunk in read_snapshot(&doc.store,previous)? {digest.update(chunk.as_bytes());}
+                    format!("{:x}",digest.finalize())==snap.content_hash
+                }
+            } else {previous.content_hash==snap.content_hash};
+            if !identical {break;} repeats+=1;
+        }
+        doc.version_skipped=repeats>=2;
+        if repeats<2 {
         doc.history.next_id += 1;
         doc.history.versions.push(Version { id: doc.history.next_id, time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(), reason: reason.into(), snapshot: snap });
+        }
         doc.history.draft = None;
         save_history(&doc.store, &doc.history)?;
         doc.dirty = false;
@@ -222,5 +238,25 @@ mod tests {
         assert_eq!(&doc.history.versions[1].snapshot.chunks[2..],&original_ids[2..]);
         assert_eq!(fs::read_dir(doc.store.join("objects")).unwrap().count(),before+1);
         println!("Large writing open + two saves: {:.2}s; {} chunks, {} compressed bytes",start.elapsed().as_secs_f64(),doc.chunks.len(),doc.history_bytes);
+    }
+}
+
+#[cfg(test)] mod duplicate_tests {
+    use super::*;
+    #[test] fn repeated_save_is_limited_even_after_reopen() {
+        let root=PathBuf::from("verification").join(format!("duplicate-{}",SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&root).unwrap();let path=root.join("book.txt");fs::write(&path,"相同🙂").unwrap();
+        let mut doc=open(&root,path.clone(),false).unwrap();
+        for _ in 0..5 {doc=save(doc,Some("手動儲存")).unwrap();}
+        assert_eq!(doc.history.versions.len(),2);
+        let index=doc.store.join("history.json");
+        let mut legacy:serde_json::Value=serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
+        for version in legacy["versions"].as_array_mut().unwrap(){version["snapshot"].as_object_mut().unwrap().remove("content_hash");}
+        fs::write(&index,serde_json::to_vec(&legacy).unwrap()).unwrap();
+        drop(doc);let mut doc=open(&root,path,false).unwrap();doc=save(doc,Some("關閉儲存")).unwrap();assert_eq!(doc.history.versions.len(),2);
+        doc.chunks=vec![Arc::new("相同".into()),Arc::new("🙂".into())];
+        doc=save(doc,Some("重分塊")).unwrap();assert_eq!(doc.history.versions.len(),2);assert!(doc.version_skipped);
+        doc.chunks=split("改動");doc=save(doc,Some("修改")).unwrap();assert_eq!(doc.history.versions.len(),3);
+        doc=save(doc,Some("儲存")).unwrap();doc=save(doc,Some("儲存")).unwrap();assert_eq!(doc.history.versions.len(),4);
     }
 }

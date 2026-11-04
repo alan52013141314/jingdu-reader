@@ -16,11 +16,12 @@ pub struct Writer {
     root: PathBuf, receiver: Option<mpsc::Receiver<store::Result<Completion>>>, after: After,
     last_auto: Instant, history_open: bool, left_id: u64, right_id: u64,
     comparison: Option<(Chunks, Chunks)>, comparison_ids: (u64,u64), differences: Vec<usize>, diff_page: usize,
+    diff_cache: Option<(usize,egui::text::LayoutJob,egui::text::LayoutJob,bool)>,
     confirm_delete: Option<u64>, jump: usize,
 }
 impl Writer {
     pub fn new(root: PathBuf, preferences: Preferences) -> Self {
-        Self { preferences, root, doc: None, message: String::new(), read_ready: false, allow_close: false, close_pending: false, receiver: None, after: After::Nothing, last_auto: Instant::now(), history_open: false, left_id: 0, right_id: 0, comparison: None, comparison_ids: (0,0), differences: vec![], diff_page: 0, confirm_delete: None, jump: 1 }
+        Self { preferences, root, doc: None, message: String::new(), read_ready: false, allow_close: false, close_pending: false, receiver: None, after: After::Nothing, last_auto: Instant::now(), history_open: false, left_id: 0, right_id: 0, comparison: None, comparison_ids: (0,0), differences: vec![], diff_page: 0, diff_cache: None, confirm_delete: None, jump: 1 }
     }
     pub fn busy(&self) -> bool { self.receiver.is_some() }
     fn task(&mut self, ctx: &egui::Context, after: After, work: impl FnOnce() -> store::Result<Completion> + Send + 'static) {
@@ -83,12 +84,13 @@ impl Writer {
                             if !was_same && self.preferences.last.as_ref().is_some_and(|p|crate::key(p)==crate::key(&doc.path)) {doc.page=self.preferences.page.min(doc.chunks.len()-1);}
                             self.preferences.last=Some(doc.path.clone());self.preferences.page=doc.page;self.jump=doc.page+1;
                             self.message=if doc.dirty{"恢復草稿已保存／載入；原 TXT 尚未更新"}else{"文件已就緒；手動儲存或關閉將建立版本"}.into();
+                            if doc.version_skipped {self.message="已儲存；相同內容最多保留兩個連續版本，不再新增重複節點".into();}
                             self.doc=Some(doc);self.last_auto=Instant::now();
                             match after {After::Close=>{self.allow_close=true;ctx.send_viewport_cmd(egui::ViewportCommand::Close);},After::Read=>self.read_ready=true,After::Open(path,create)=>self.begin_open(path,create,ctx),After::Nothing=>{}}
                         }
                         Ok(Completion::Compare(left,right))=>{
                             self.differences=(0..left.len().max(right.len())).filter(|i|left.get(*i)!=right.get(*i)).collect();
-                            self.comparison=Some((left,right));self.diff_page=0;self.message="版本已載入，可查看差異區塊".into();
+                            self.diff_cache=None;self.comparison=Some((left,right));self.diff_page=0;self.message="版本已載入，可查看差異區塊".into();
                         }
                         Err(error)=>{self.close_pending=false;self.message=format!("操作失敗，文件保持開啟：{error}");self.last_auto=Instant::now();}
                     }
@@ -187,11 +189,17 @@ impl Writer {
                     if ui.button("下一處差異").clicked(){if let Some(n)=self.differences.iter().copied().find(|n|*n>self.diff_page).or_else(||self.differences.first().copied()){self.diff_page=n;}}
                 });
                 let a=left.get(self.diff_page).map(|s|s.as_str()).unwrap_or("");let b=right.get(self.diff_page).map(|s|s.as_str()).unwrap_or("");
+                if self.diff_cache.as_ref().is_none_or(|cache|cache.0!=self.diff_page){
+                    let (l,r,coarse)=crate::version_diff::diff(a,b);
+                    self.diff_cache=Some((self.diff_page,crate::version_diff::layout(&l,true),crate::version_diff::layout(&r,false),coarse));
+                }
+                let cache=self.diff_cache.as_ref().unwrap();
+                ui.label("紅底刪除線＝A 中刪除文字；綠底＝B 中新增文字；共同文字保持原色。");
+                if cache.3{ui.colored_label(egui::Color32::DARK_RED,"此區塊差異過大，改為標示共同前後文之間的變更範圍。");}
                 ui.columns(2,|cols|{
-                    cols[0].label("A 舊版本");cols[1].label("B 新版本");
-                    let same=a==b;
-                    egui::ScrollArea::vertical().id_salt("compare-a").max_height(350.0).show(&mut cols[0],|ui|{ui.label(egui::RichText::new(a).color(if same{egui::Color32::DARK_GRAY}else{egui::Color32::DARK_RED}));});
-                    egui::ScrollArea::vertical().id_salt("compare-b").max_height(350.0).show(&mut cols[1],|ui|{ui.label(egui::RichText::new(b).color(if same{egui::Color32::DARK_GRAY}else{egui::Color32::DARK_GREEN}));});
+                    cols[0].label(format!("A #{}",self.comparison_ids.0));cols[1].label(format!("B #{}",self.comparison_ids.1));
+                    egui::ScrollArea::vertical().id_salt(("compare-a",self.diff_page)).max_height(350.0).show(&mut cols[0],|ui|{ui.label(cache.1.clone());});
+                    egui::ScrollArea::vertical().id_salt(("compare-b",self.diff_page)).max_height(350.0).show(&mut cols[1],|ui|{ui.label(cache.2.clone());});
                 });
             }
         });self.history_open=open;
