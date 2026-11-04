@@ -1,5 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod writing;
+mod writing_store;
+
 use eframe::egui::{self, Color32};
 use regex::Regex;
 use std::{path::{Path, PathBuf}, sync::{mpsc, Arc}, time::Instant, collections::BTreeMap};
@@ -91,7 +94,7 @@ struct SavedBook {
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
-struct LibraryState { last: Option<PathBuf>, folder: Option<PathBuf>, books: BTreeMap<String, SavedBook>, settings: Option<Settings>, format_version: u32 }
+struct LibraryState { last: Option<PathBuf>, folder: Option<PathBuf>, books: BTreeMap<String, SavedBook>, settings: Option<Settings>, format_version: u32, writing: writing::Preferences }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -193,6 +196,7 @@ struct Reader {
     state: LibraryState, state_path: PathBuf, active_path: Option<PathBuf>, pending_path: Option<PathBuf>,
     last_save: Instant, saved_json: String, save_error: String, state_readable: bool,
     character: usize, row_offset: f32, pending_anchor: Option<(usize, f32)>,
+    writer: writing::Writer, appearance_open: bool,
 }
 
 impl Reader {
@@ -214,10 +218,12 @@ impl Reader {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (LibraryState::default(), String::new()),
             Err(e) => (LibraryState::default(), format!("閱讀紀錄讀取失敗：{e}")),
         };
-        let mut app = Self { files: vec![], folder: state.folder.clone().unwrap_or_else(|| BOOKS.into()), book: None, page: 0, receiver: None, status: "滑鼠移到左邊或上邊開啟功能欄，選擇小說開始閱讀".into(), search: String::new(), matches: vec![], font: 24.0, font_choice: 2, background: Color32::from_rgb(246, 240, 225), foreground: Color32::from_rgb(48, 43, 37), spacing: Spacing::Paragraph, jump: 1, left_margin: 28.0, right_margin: 28.0, line_spacing: 1.45, paragraph_gap: 34.8, no_margins: false, read_chars: 0, offset: 0.0, strength: 1.0, pinned: false, top_visible: false, left_visible: false, state, state_path, active_path: None, pending_path: None, last_save: Instant::now(), saved_json: String::new(), state_readable: save_error.is_empty(), save_error, character: 0, row_offset: 0.0, pending_anchor: None };
+        let writer = writing::Writer::new(state_path.with_file_name("writing-data"), state.writing.clone());
+        let mut app = Self { files: vec![], folder: state.folder.clone().unwrap_or_else(|| BOOKS.into()), book: None, page: 0, receiver: None, status: "滑鼠移到左邊或上邊開啟功能欄，選擇小說開始閱讀".into(), search: String::new(), matches: vec![], font: 24.0, font_choice: 2, background: Color32::from_rgb(246, 240, 225), foreground: Color32::from_rgb(48, 43, 37), spacing: Spacing::Paragraph, jump: 1, left_margin: 28.0, right_margin: 28.0, line_spacing: 1.45, paragraph_gap: 34.8, no_margins: false, read_chars: 0, offset: 0.0, strength: 1.0, pinned: false, top_visible: false, left_visible: false, state, state_path, active_path: None, pending_path: None, last_save: Instant::now(), saved_json: String::new(), state_readable: save_error.is_empty(), save_error, character: 0, row_offset: 0.0, pending_anchor: None, writer, appearance_open: false };
         app.apply_settings();
         app.refresh();
-        if let Some(path) = std::env::args_os().nth(1).map(PathBuf::from).or_else(|| app.state.last.clone()) { app.open(path, cc.egui_ctx.clone()); }
+        let startup = std::env::args_os().nth(1).map(PathBuf::from).or_else(|| if app.writer.preferences.enabled { app.writer.preferences.last.clone().or_else(|| app.state.last.clone()) } else { app.state.last.clone() });
+        if let Some(path) = startup { app.open(path, cc.egui_ctx.clone()); }
         app
     }
 
@@ -239,6 +245,7 @@ impl Reader {
             self.state.books.insert(key(path), SavedBook { page: self.page, offset: self.offset, character: Some(self.character), row_offset: self.row_offset });
             self.state.last = Some(path.clone());
         }
+        self.state.writing = self.writer.preferences.clone();
         self.state.settings = Some(Settings { font: self.font, font_choice: self.font_choice, background: self.background.to_array(), foreground: self.foreground.to_array(), spacing: self.spacing, strength: self.strength, pinned: self.pinned, left_margin: self.left_margin, right_margin: self.right_margin, line_spacing: self.line_spacing, paragraph_gap: self.paragraph_gap, no_margins: self.no_margins });
         self.state.folder = Some(self.folder.clone());
         self.state.format_version = 2;
@@ -273,6 +280,7 @@ impl Reader {
     }
 
     fn open(&mut self, path: PathBuf, ctx: egui::Context) {
+        if self.writer.preferences.enabled { self.writer.open(path, false, &ctx); return; }
         if self.receiver.is_some() { return; }
         self.persist();
         self.active_path = None;
@@ -293,6 +301,51 @@ impl Reader {
         });
     }
 
+    fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> Option<PathBuf> {
+        let mut open = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("靜讀");
+            if ui.add_enabled(self.receiver.is_none() && !self.writer.busy(), egui::Button::new(if self.writer.preferences.enabled { "切回閱讀" } else { "寫作模式" })).clicked() {
+                if self.writer.preferences.enabled { self.writer.leave(ctx); }
+                else {
+                    self.writer.preferences.enabled = true;
+                    if let Some(path)=self.active_path.clone().or_else(||self.writer.preferences.last.clone()) {self.writer.open(path,false,ctx);}
+                    self.persist();
+                }
+            }
+            if ui.add_enabled(self.receiver.is_none() && !self.writer.busy(), egui::Button::new("開啟 TXT")).clicked() { open=rfd::FileDialog::new().add_filter("文字檔", &["txt"]).set_directory(&self.folder).pick_file(); }
+            if self.writer.preferences.enabled { self.writer.toolbar(ui,ctx); }
+            ui.menu_button("書架",|ui|{
+                if ui.button("選擇資料夾").clicked(){if let Some(p)=rfd::FileDialog::new().set_directory(&self.folder).pick_folder(){self.folder=p;self.refresh();}ui.close_menu();}
+                if ui.button("重新整理").clicked(){self.refresh();ui.close_menu();}
+            });
+            if ui.button("外觀／自存設定").clicked(){self.appearance_open=!self.appearance_open;}
+            ui.checkbox(&mut self.pinned,"固定功能欄");
+            if ui.checkbox(&mut self.no_margins,"不留白").changed(){self.pending_anchor=Some((self.character,self.row_offset));}
+        }); open
+    }
+    fn sidebar(&mut self, ui: &mut egui::Ui, open: &mut Option<PathBuf>) {
+            ui.heading("書架");
+            ui.small(self.folder.to_string_lossy());
+            egui::ScrollArea::vertical().id_salt("books").max_height(160.0).show_rows(ui, 25.0, self.files.len(), |ui, range| {
+                for n in range { let path = &self.files[n]; if ui.add_enabled(self.receiver.is_none(), egui::Button::new(path.file_stem().unwrap_or_default().to_string_lossy()).truncate()).clicked() { *open = Some(path.clone()); } }
+            });
+            ui.separator();
+            if self.writer.preferences.enabled { self.writer.sidebar(ui); return; }
+            ui.heading("章節");
+            if ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("搜尋章節標題")).changed() { self.filter(); }
+            ui.small(format!("{} 筆結果", self.matches.len()));
+            if let Some(book) = &self.book {
+                let current = book.chapters.partition_point(|c| c.page <= self.page).saturating_sub(1);
+                egui::ScrollArea::vertical().id_salt("chapters").show_rows(ui, 27.0, self.matches.len(), |ui, range| {
+                    for n in range {
+                        let i = self.matches[n]; let chapter = &book.chapters[i];
+                        if ui.add(egui::Button::new(&chapter.title).selected(current == i).truncate()).on_hover_text(&chapter.title).clicked() { self.page = chapter.page; self.offset = 0.0; }
+                    }
+                });
+            }
+    }
+
     fn filter(&mut self) {
         let query = self.search.trim().to_lowercase();
         self.matches = self.book.as_ref().map(|b| b.chapters.iter().enumerate().filter(|(_, c)| query.is_empty() || c.title.to_lowercase().contains(&query)).map(|(i, _)| i).collect()).unwrap_or_default();
@@ -302,6 +355,17 @@ impl Reader {
 impl eframe::App for Reader {
     fn on_exit(&mut self, _: Option<&eframe::glow::Context>) { self.persist(); }
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.writer.tick(ctx);
+        if self.writer.read_ready {
+            self.writer.read_ready = false; self.writer.preferences.enabled = false;
+            if let Some(doc) = &self.writer.doc {
+                let chunks = doc.chunks.clone(); let path = doc.path.clone();
+                self.pending_path = Some(path.clone()); self.book = None;
+                let (tx,rx)=mpsc::channel(); self.receiver=Some(rx); let ctx=ctx.clone();
+                std::thread::spawn(move|| { let text=chunks.iter().map(|s|s.as_str()).collect::<String>(); let _=tx.send(Ok(index(text,path.file_name().unwrap_or_default().to_string_lossy().into())));ctx.request_repaint(); });
+            }
+            self.persist();
+        }
         if let Some(rx) = &self.receiver {
             match rx.try_recv() {
                 Ok(result) => {
@@ -321,17 +385,16 @@ impl eframe::App for Reader {
         let mut open = None;
         let pointer = ctx.input(|i| i.pointer.hover_pos());
         let popup = ctx.memory(|m| m.any_popup_open());
-        self.top_visible = self.pinned || popup || pointer.is_some_and(|p| p.y < if self.top_visible { 175.0 } else { 18.0 });
-        self.left_visible = self.pinned || pointer.is_some_and(|p| p.x < if self.left_visible { 300.0 } else { 18.0 });
-        if self.top_visible { egui::Window::new("settings").title_bar(false).resizable(false).fixed_pos([8.0, 8.0]).default_width(820.0).show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.heading("靜讀 · TXT 閱讀器");
-                if ui.add_enabled(self.receiver.is_none(), egui::Button::new("開啟 TXT")).clicked() { open = rfd::FileDialog::new().add_filter("文字檔", &["txt"]).set_directory(&self.folder).pick_file(); }
-                if ui.button("書架資料夾").clicked() { if let Some(p) = rfd::FileDialog::new().set_directory(&self.folder).pick_folder() { self.folder = p; self.refresh(); } }
-                if ui.button("重新整理").clicked() { self.refresh(); }
-                ui.checkbox(&mut self.pinned, "固定功能欄");
-                if self.receiver.is_some() { ui.spinner(); }
-            });
+        self.top_visible = self.pinned || popup || pointer.is_some_and(|p| p.y < if self.top_visible { 80.0 } else { 18.0 });
+        self.left_visible = self.pinned || pointer.is_some_and(|p| p.x < if self.left_visible { 290.0 } else { 18.0 });
+        if self.pinned {
+            egui::TopBottomPanel::top("toolbar-dock").show(ctx, |ui| { open = self.toolbar(ui,ctx); });
+        } else if self.top_visible {
+            egui::Window::new("toolbar-hover").title_bar(false).resizable(false).fixed_pos([0.0,0.0]).show(ctx, |ui| { open = self.toolbar(ui,ctx); });
+        }
+        if self.appearance_open {
+            let mut show = true;
+            egui::Window::new("外觀與寫作設定").open(&mut show).default_width(650.0).show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label("配色");
                 for (name, bg, fg) in [("紙張", [246,240,225], [48,43,37]), ("夜讀", [28,31,36], [218,222,228]), ("護眼綠", [215,232,210], [36,57,40]), ("純白", [255,255,255], [30,30,30]), ("灰霧", [224,227,232], [40,45,53])] {
@@ -367,9 +430,13 @@ impl eframe::App for Reader {
                 if left || right { self.pending_anchor = Some((self.character, self.row_offset)); }
                 if ui.checkbox(&mut self.no_margins, "不留白").on_hover_text("覆蓋左右留白；取消後恢復原設定").changed() { self.pending_anchor = Some((self.character, self.row_offset)); }
             });
-        }); }
+                ui.separator(); self.writer.settings(ui);
+            });
+            self.appearance_open = show;
+        }
         egui::TopBottomPanel::bottom("navigation").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
+                if self.writer.preferences.enabled { self.writer.status(ui); return; }
                 if let Some(book) = &self.book {
                     let total = book.pages.len();
                     if ui.add_enabled(self.page > 0, egui::Button::new("◀ 上一頁")).clicked() { self.page -= 1; self.offset = 0.0; }
@@ -390,31 +457,21 @@ impl eframe::App for Reader {
                 if !self.save_error.is_empty() { ui.colored_label(Color32::RED, &self.save_error); }
             });
         });
-        if self.left_visible { egui::Window::new("library").title_bar(false).fixed_pos([8.0, 185.0]).fixed_size([270.0, (ctx.screen_rect().height()-255.0).max(200.0)]).resizable(false).show(ctx, |ui| {
-            ui.heading("書架");
-            ui.small(self.folder.to_string_lossy());
-            egui::ScrollArea::vertical().id_salt("books").max_height(160.0).show_rows(ui, 25.0, self.files.len(), |ui, range| {
-                for n in range { let path = &self.files[n]; if ui.add_enabled(self.receiver.is_none(), egui::Button::new(path.file_stem().unwrap_or_default().to_string_lossy()).truncate()).clicked() { open = Some(path.clone()); } }
-            });
-            ui.separator(); ui.heading("章節");
-            if ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("搜尋章節標題")).changed() { self.filter(); }
-            ui.small(format!("{} 筆結果", self.matches.len()));
-            if let Some(book) = &self.book {
-                let current = book.chapters.partition_point(|c| c.page <= self.page).saturating_sub(1);
-                egui::ScrollArea::vertical().id_salt("chapters").show_rows(ui, 27.0, self.matches.len(), |ui, range| {
-                    for n in range {
-                        let i = self.matches[n]; let chapter = &book.chapters[i];
-                        if ui.add(egui::Button::new(&chapter.title).selected(current == i).truncate()).on_hover_text(&chapter.title).clicked() { self.page = chapter.page; self.offset = 0.0; }
-                    }
-                });
-            }
-        }); }
+        if self.pinned {
+            egui::SidePanel::left("library-dock").exact_width(270.0).resizable(false).show(ctx, |ui| { self.sidebar(ui,&mut open); });
+        } else if self.left_visible {
+            egui::Window::new("library-hover").title_bar(false).fixed_pos([0.0,60.0]).fixed_size([270.0,(ctx.screen_rect().height()-140.0).max(200.0)]).resizable(false).show(ctx, |ui| { self.sidebar(ui,&mut open); });
+        }
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(self.background).inner_margin(0.0)).show(ctx, |ui| {
             let mut rect = ui.available_rect_before_wrap();
             rect.min.y += 28.0; rect.max.y -= 28.0;
-            if self.pinned { rect.min.x += 300.0; rect.min.y += 175.0; }
+
             let (left, right) = reading_margins(rect.width(), if self.no_margins { 0.0 } else { self.left_margin }, if self.no_margins { 0.0 } else { self.right_margin });
             rect.min.x += left; rect.max.x -= right;
+            if self.writer.preferences.enabled {
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| { self.writer.editor(ui,self.font,self.foreground,self.background); });
+                return;
+            }
             if let Some(book) = &self.book {
                 let title_pos = rect.min;
                 rect.min.y += 30.0;
@@ -456,6 +513,7 @@ impl eframe::App for Reader {
                 ui.painter().text(rect.min, egui::Align2::LEFT_TOP, &self.status, egui::FontId::proportional(22.0), self.foreground);
             }
         });
+        self.writer.history_ui(ctx);
         if self.last_save.elapsed().as_secs_f32() >= 1.0 { self.persist(); }
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
         if let Some(path) = open { self.open(path, ctx.clone()); }

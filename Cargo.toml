@@ -1,6 +1,6 @@
 [package]
 name = "jingdu-reader"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "A local Rust desktop reader for large Chinese TXT novels"
 
@@ -14,3 +14,5 @@ rfd = { version = "0.15", default-features = false }
 regex = "=1.10.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "=1.0.114"
+sha2 = "=0.10.9"
+flate2 = "=1.1.10"
