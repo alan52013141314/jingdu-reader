@@ -31,7 +31,7 @@ pub struct History { pub versions: Vec<Version>, pub draft: Option<Snapshot>, pu
 
 #[derive(Clone)]
 pub struct Document {
-    pub path: PathBuf, pub store: PathBuf, pub chunks: Chunks, pub page: usize,
+    pub chapters:Vec<(String,usize)>, pub path: PathBuf, pub store: PathBuf, pub chunks: Chunks, pub page: usize,
     pub encoding: Encoding, pub revision: u64, pub drafted_revision: u64, pub dirty: bool,
     pub history: History, pub history_bytes: u64, pub version_skipped: bool,
     // Exclusive document lock is retained by all in-flight snapshots too.
@@ -120,7 +120,17 @@ pub fn open(root: &Path, path: PathBuf, create: bool) -> Result<Document> {
         (split(&crate::decode(bytes)?), encoding, 0, false)
     };
     let page = page.min(chunks.len().saturating_sub(1));
-    Ok(Document { path, version_skipped: false, history_bytes: history_bytes(&store, &history), store, chunks, page, encoding, revision: 0, drafted_revision: 0, dirty, history, _lock: lock })
+    let chapters=chapter_positions(&chunks);
+    Ok(Document { chapters, path, version_skipped: false, history_bytes: history_bytes(&store, &history), store, chunks, page, encoding, revision: 0, drafted_revision: 0, dirty, history, _lock: lock })
+}
+pub fn chapter_positions(chunks:&Chunks)->Vec<(String,usize)>{
+    let heading=regex::Regex::new(r"^(?:第[0-9０-９零〇一二三四五六七八九十百千萬万兩两]+[章回節节卷部篇集]|序章|楔子|尾聲|尾声|終章|终章|番外|(?i:chapter)\s+[0-9]+)").unwrap();
+    let mut result=Vec::new();let mut offset=0;let mut line=String::new();let mut start=0;
+    for chunk in chunks{for part in chunk.split_inclusive('\n'){
+        line.push_str(part);offset+=part.len();
+        if part.ends_with('\n'){if line.trim().len()<=360&&heading.is_match(line.trim()){result.push((line.trim().into(),start));}line.clear();start=offset;}
+    }}
+    if line.trim().len()<=360&&heading.is_match(line.trim()){result.push((line.trim().into(),start));}result
 }
 fn write_original(doc: &Document) -> Result<()> {
     atomic(&doc.path, |file| {
@@ -141,6 +151,7 @@ fn write_original(doc: &Document) -> Result<()> {
 pub fn save(mut doc: Document, reason: Option<&str>) -> Result<Document> {
     // Retry after a partial failure must retain any history already committed on disk.
     if let Ok(bytes) = fs::read(doc.store.join("history.json")) { doc.history = serde_json::from_slice(&bytes).map_err(|e|format!("版本紀錄無法讀取：{e}"))?; }
+    doc.chapters=chapter_positions(&doc.chunks);
     doc.version_skipped=false;
     let snap = snapshot(&doc)?;
     // First persist a recovery draft, so a failure after replacing the TXT remains recoverable.

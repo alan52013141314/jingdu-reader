@@ -18,10 +18,11 @@ pub struct Writer {
     comparison: Option<crate::version_diff::Comparison>, comparison_ids:(u64,u64), selected_change:usize,
     highlight_since: Instant, scroll_change: bool,
     confirm_delete: Option<u64>, jump: usize,
+    position:usize, pub seek:Option<std::ops::Range<usize>>, pub seek_after_open:Option<usize>, chapter_query:String, history_find:crate::find::Find, find_hit:Option<crate::find::Hit>,
 }
 impl Writer {
     pub fn new(root: PathBuf, preferences: Preferences) -> Self {
-        Self { preferences, root, doc: None, message: String::new(), read_ready: false, allow_close: false, close_failed:false, close_pending: false, receiver: None, after: After::Nothing, last_auto: Instant::now(), history_open: false, comparison_tab:false, left_id: 0, right_id: 0, comparison: None, comparison_ids:(0,0), selected_change:0, highlight_since:Instant::now(), scroll_change:true, confirm_delete: None, jump: 1 }
+        Self { preferences, root, doc: None, message: String::new(), read_ready: false, allow_close: false, close_failed:false, close_pending: false, receiver: None, after: After::Nothing, last_auto: Instant::now(), history_open: false, comparison_tab:false, left_id: 0, right_id: 0, comparison: None, comparison_ids:(0,0), selected_change:0, highlight_since:Instant::now(), scroll_change:true, confirm_delete: None, jump: 1, position:0, seek:None,seek_after_open:None,chapter_query:String::new(),history_find:Default::default(),find_hit:None }
     }
     pub fn busy(&self) -> bool { self.receiver.is_some() }
     fn task(&mut self, ctx: &egui::Context, after: After, work: impl FnOnce() -> store::Result<Completion> + Send + 'static) {
@@ -30,7 +31,7 @@ impl Writer {
     }
     pub fn open(&mut self, path: PathBuf, create: bool, ctx: &egui::Context) {
         if self.busy() { return; }
-        if self.doc.as_ref().is_some_and(|d| crate::key(&d.path)==crate::key(&path)) { return; }
+        if self.doc.as_ref().is_some_and(|d| crate::key(&d.path)==crate::key(&path)) { if let Some(byte)=self.seek_after_open.take(){self.seek_byte(byte..byte);}return; }
         if self.doc.as_ref().is_some_and(|d| d.dirty) {
             self.save(None,After::Open(path,create),ctx); return;
         }
@@ -84,11 +85,11 @@ impl Writer {
                             self.preferences.last=Some(doc.path.clone());self.preferences.page=doc.page;self.jump=doc.page+1;
                             self.message=if doc.dirty{"恢復草稿已保存／載入；原 TXT 尚未更新"}else{"文件已就緒；手動儲存或關閉將建立版本"}.into();
                             if doc.version_skipped {self.message="已儲存；相同內容最多保留兩個連續版本，不再新增重複節點".into();}
-                            self.doc=Some(doc);self.last_auto=Instant::now();
+                            self.doc=Some(doc);if let Some(byte)=self.seek_after_open.take(){self.seek_byte(byte..byte);}self.last_auto=Instant::now();
                             match after {After::Close=>{self.allow_close=true;},After::Read=>self.read_ready=true,After::Open(path,create)=>self.begin_open(path,create,ctx),After::Nothing=>{}}
                         }
                         Ok(Completion::Compare(comparison))=>{
-                            self.comparison_tab=true;self.comparison=Some(comparison);self.selected_change=0;self.scroll_change=true;self.highlight_since=Instant::now();self.message="全文差異已就緒".into();
+                            self.find_hit=None;self.comparison_tab=true;self.comparison=Some(comparison);self.selected_change=0;self.scroll_change=true;self.highlight_since=Instant::now();self.message="全文差異已就緒".into();
                         }
                         Err(error)=>{self.close_failed=matches!(after,After::Close)||self.close_pending;self.close_pending=false;self.message=format!("操作失敗，文件保持開啟：{error}");self.last_auto=Instant::now();}
                     }
@@ -114,16 +115,28 @@ impl Writer {
         ui.horizontal_wrapped(|ui|{ui.label("自動草稿間隔");ui.add(egui::DragValue::new(&mut self.preferences.autosave_secs).range(5..=3600).suffix(" 秒"));ui.label("歷史提醒上限");ui.add(egui::DragValue::new(&mut self.preferences.limit_mib).range(1..=102400).suffix(" MiB"));});
         ui.small("自動儲存只更新最新恢復草稿；手動儲存／關閉才建立版本。設定為所有作品共用。");
     }
-    pub fn sidebar(&mut self,ui:&mut egui::Ui){
-        ui.heading("寫作區塊");ui.small("大型文件分塊編輯；儲存會依序合併全部內容。");
-        let busy=self.busy();
+    pub fn seek_byte(&mut self,range:std::ops::Range<usize>){
+        self.position=range.start;
         if let Some(doc)=&mut self.doc{
-            egui::ScrollArea::vertical().id_salt("writing-chunks").show_rows(ui,26.0,doc.chunks.len(),|ui,range|{
-                for n in range{let title=doc.chunks[n].lines().find(|l|!l.trim().is_empty()).unwrap_or("（空白）").chars().take(28).collect::<String>();
-                    if ui.add_enabled(!busy,egui::Button::new(format!("{}. {title}",n+1)).selected(doc.page==n).truncate()).clicked(){doc.page=n;}
-                }
+            let mut start=0;for(i,chunk)in doc.chunks.iter().enumerate(){if range.start<start+chunk.len()||i+1==doc.chunks.len(){
+                doc.page=i;let mut a=range.start.saturating_sub(start).min(chunk.len());while !chunk.is_char_boundary(a){a-=1;}
+                let mut b=range.end.saturating_sub(start).min(chunk.len());while !chunk.is_char_boundary(b){b-=1;}
+                self.seek=Some(chunk[..a].chars().count()..chunk[..b].chars().count());self.jump=i+1;break;
+            }start+=chunk.len();}
+        }
+    }
+    pub fn byte_position(&self)->usize{self.position}
+    pub fn sidebar(&mut self,ui:&mut egui::Ui){
+        ui.heading("寫作章節");ui.add(egui::TextEdit::singleline(&mut self.chapter_query).hint_text("搜尋章節標題"));
+        let mut jump=None;let busy=self.busy();
+        if let Some(doc)=&self.doc{
+            let query=self.chapter_query.trim();let chapters:Vec<_>=doc.chapters.iter().filter(|(name,_)|name.contains(query)).collect();
+            ui.small("按章名定位；編輯仍採小區塊，不會刪除章節。");
+            egui::ScrollArea::vertical().id_salt("writing-chapters").show_rows(ui,26.0,chapters.len(),|ui,range|{
+                for i in range{let(name,offset)=chapters[i];if ui.add_enabled(!busy,egui::Button::new(name).truncate()).clicked(){jump=Some(*offset);}}
             });
         }
+        if let Some(offset)=jump{self.seek_byte(offset..offset);}
     }
     pub fn editor(&mut self,ui:&mut egui::Ui,font:f32,foreground:egui::Color32,background:egui::Color32){
         *ui.visuals_mut()=document_visuals(background,foreground);
@@ -140,9 +153,18 @@ impl Writer {
         });
         ui.small("區塊界線不是正文換行；保存會原樣接合。貼上較長文字後自動分塊。");
         egui::ScrollArea::vertical().id_salt(("writer",doc.path.clone(),doc.page)).show(ui,|ui|{
+            let prefix:usize=doc.chunks[..doc.page].iter().map(|s|s.len()).sum();
             let text=Arc::make_mut(&mut doc.chunks[doc.page]);
-            let response=ui.add_enabled(!busy,egui::TextEdit::multiline(text).id_salt(("writing-text",doc.path.clone(),doc.page)).font(egui::FontId::proportional(font)).text_color(foreground).background_color(background).desired_width(f32::INFINITY).desired_rows(20));
-            if response.changed(){doc.revision+=1;doc.dirty=true;
+            let mut output=ui.add_enabled_ui(!busy,|ui|egui::TextEdit::multiline(text).id_salt(("writing-text",doc.path.clone(),doc.page)).font(egui::FontId::proportional(font)).text_color(foreground).background_color(background).desired_width(f32::INFINITY).desired_rows(20).show(ui)).inner;
+            if let Some(range)=self.seek.take(){
+                let a=egui::text::CCursor::new(range.start);let b=egui::text::CCursor::new(range.end);
+                output.state.cursor.set_char_range(Some(egui::text::CCursorRange::two(a,b)));output.state.store(ui.ctx(),output.response.id);
+                output.response.request_focus();let caret=output.galley.pos_from_cursor(&output.galley.from_ccursor(a));ui.scroll_to_rect(caret.translate(output.galley_pos.to_vec2()),Some(egui::Align::Center));
+            }
+            else if let Some(cursor)=output.cursor_range{
+                self.position=prefix+text.char_indices().nth(cursor.primary.ccursor.index).map_or(text.len(),|(i,_)|i);
+            }
+            if output.response.changed(){doc.revision+=1;doc.dirty=true;
                 if text.chars().count()>store::CHUNK_CHARS*2{let parts=store::split(text);doc.chunks.splice(doc.page..=doc.page,parts);}
             }
         });
@@ -158,6 +180,7 @@ impl Writer {
     pub fn history_ui(&mut self,ctx:&egui::Context,settings:&crate::Settings){
         let bg=egui::Color32::from_rgba_unmultiplied(settings.background[0],settings.background[1],settings.background[2],settings.background[3]);
         let fg=egui::Color32::from_rgba_unmultiplied(settings.foreground[0],settings.foreground[1],settings.foreground[2],settings.foreground[3]);
+        self.history_find.shortcut(ctx);
         let mut action=None;let mut compare=false;let busy=self.busy();
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(bg).inner_margin(12.0)).show(ctx,|ui|{
             *ui.visuals_mut()=document_visuals(bg,fg);
@@ -172,6 +195,12 @@ impl Writer {
                 let title=comparison_title(&doc.path,self.comparison_ids);
                 if ui.add_enabled(self.comparison.is_some()||self.comparison_tab,egui::Button::new(title).selected(self.comparison_tab)).clicked(){self.comparison_tab=true;self.scroll_change=true;}
             });
+            if self.history_find.source(format!("{:?}",self.comparison_ids)){self.find_hit=None;}
+            if self.history_find.open{
+                if let Some(c)=&self.comparison{
+                    if let Some(hit)=self.history_find.ui(ui,||vec![vec![Arc::new(c.a.clone())],vec![Arc::new(c.b.clone())]]){self.find_hit=Some(hit);self.comparison_tab=true;self.scroll_change=true;self.highlight_since=Instant::now();}
+                }else{ui.label("請先選擇版本並比較，再尋找 A／B 全文。");}
+            }
             ui.separator();
             if !self.comparison_tab {
                 if ui.add_enabled(!busy&&self.left_id>0&&self.right_id>0,egui::Button::new("比較 A / B")).clicked(){compare=true;}
@@ -198,12 +227,12 @@ impl Writer {
             ui.horizontal_wrapped(|ui|{
                 if let Some(c)=&self.comparison{
                     let count=c.changes.len();
-                    if ui.add_enabled(count>0,egui::Button::new("上一處差異")).clicked(){self.selected_change=(self.selected_change+count-1)%count;self.scroll_change=true;self.highlight_since=Instant::now();}
-                    if ui.add_enabled(count>0,egui::Button::new("下一處差異")).clicked(){self.selected_change=(self.selected_change+1)%count;self.scroll_change=true;self.highlight_since=Instant::now();}
+                    if ui.add_enabled(count>0,egui::Button::new("上一處差異")).clicked(){self.find_hit=None;self.selected_change=(self.selected_change+count-1)%count;self.scroll_change=true;self.highlight_since=Instant::now();}
+                    if ui.add_enabled(count>0,egui::Button::new("下一處差異")).clicked(){self.find_hit=None;self.selected_change=(self.selected_change+1)%count;self.scroll_change=true;self.highlight_since=Instant::now();}
                     ui.label(if count==0{"內容相同".into()}else{format!("差異 {} / {}",self.selected_change+1,count)});
                 }
             });
-            ui.label("↵ 換行 · 〔空白行〕空行 · 紅底刪除／綠底新增 · 底線為目前差異");
+            ui.label("↵ 換行（空行亦只顯示 ↵）· 紅底刪除／綠底新增 · 底線為目前差異");
             if let Some(c)=&self.comparison{
                 let elapsed=self.highlight_since.elapsed().as_secs_f32();let flash=elapsed<0.9&&(elapsed*6.0) as usize%2==0;
                 if elapsed<0.9{ctx.request_repaint_after(Duration::from_millis(70));}
@@ -211,10 +240,11 @@ impl Writer {
                 let height=ui.available_height().max(80.0);
                 ui.columns(2,|cols|{for(side,col)in cols.iter_mut().enumerate(){
                     let left=side==0;let id=if left{self.comparison_ids.0}else{self.comparison_ids.1};
-                    let location=if c.changes.is_empty(){(1,1)}else{c.location(self.selected_change,left)};
+                    let focus=self.find_hit.as_ref().map(|h|if (h.side==0)==left{h.range.clone()}else{c.map_range(h.range.clone(),h.side==0)});
+                    let location=if let Some(r)=&focus{c.location_at(r.start,left)}else if c.changes.is_empty(){(1,1)}else{c.location(self.selected_change,left)};
                     col.label(format!("{} #{id} · 第 {} 行，第 {} 字",if left{"A"}else{"B"},location.0,location.1));
                     egui::ScrollArea::vertical().id_salt(("full-diff",side)).max_height((height-settings.font-12.0).max(40.0)).show(col,|ui|{
-                        let (mut job,target)=c.view(self.selected_change,left,settings.font,fg,flash);
+                        let (mut job,target)=c.view_focus(self.selected_change,left,settings.font,fg,flash,focus);
                         for section in &mut job.sections{section.format.line_height=Some(settings.font*settings.line_spacing);}
                         let (lm,rm)=crate::reading_margins(ui.available_width(),self.preferences.compare_left,self.preferences.compare_right);
                         ui.horizontal(|ui|{ui.add_space(lm);ui.vertical(|ui|{
@@ -285,5 +315,17 @@ mod lifecycle_tests {
         let restored:Preferences=serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
         assert_eq!((restored.compare_left,restored.compare_right),(24.0,56.0));
         assert_eq!(comparison_title(std::path::Path::new("使用說明.txt"),(1,8)),"使用說明.txt#1 #8對比");
+    }
+}
+
+#[cfg(test)]mod chapter_seek_tests{
+    use super::*;
+    #[test]fn chapter_navigation_uses_text_offsets_not_chunk_numbers(){
+        let root=PathBuf::from("verification").join(format!("chapters-{}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));std::fs::create_dir_all(&root).unwrap();
+        let text=format!("第一章 開頭\n{}\n第三章 目標章名\n正文", "正文".repeat(2600));let path=root.join("book.txt");std::fs::write(&path,&text).unwrap();
+        let mut writer=Writer::new(root.join("history"),Default::default());writer.doc=Some(store::open(&writer.root,path,false).unwrap());
+        let offset=writer.doc.as_ref().unwrap().chapters.iter().find(|c|c.0.contains("第三章")).unwrap().1;
+        writer.seek_byte(offset..offset);assert_eq!(writer.byte_position(),text.find("第三章").unwrap());
+        let d=writer.doc.as_ref().unwrap();let start=writer.seek.as_ref().unwrap().start;assert!(d.chunks[d.page].chars().skip(start).collect::<String>().starts_with("第三章"));
     }
 }

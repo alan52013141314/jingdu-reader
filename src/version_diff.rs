@@ -93,9 +93,13 @@ impl Comparison {
         let al:Vec<&str>=amid.split_inclusive('\n').collect();let bl:Vec<&str>=bmid.split_inclusive('\n').collect();
         let mut positions:HashMap<&str,(Vec<usize>,usize)>=HashMap::new();
         for(i,l)in bl.iter().enumerate(){positions.entry(l).or_default().0.push(i);}
-        let candidates:Vec<(usize,usize)>=al.iter().enumerate().filter_map(|(i,l)|{
-            let entry=positions.get_mut(l)?;let bi=entry.0.get(entry.1).copied()?;entry.1+=1;Some((i,bi))
+        let mut counts:HashMap<&str,usize>=HashMap::new();for l in &al{*counts.entry(l).or_default()+=1;}
+        let mut candidates:Vec<(usize,usize)>=al.iter().enumerate().filter_map(|(i,l)|{
+            let entry=positions.get(l)?;(entry.0.len()==1&&counts[l]==1).then(||(i,entry.0[0]))
         }).collect();
+        if candidates.is_empty(){
+            candidates=al.iter().enumerate().filter_map(|(i,l)|{let entry=positions.get_mut(l)?;let bi=entry.0.get(entry.1).copied()?;entry.1+=1;Some((i,bi))}).collect();
+        }
         let mut tails:Vec<usize>=Vec::new();let mut prev=vec![None;candidates.len()];
         for(i,(_,bline))in candidates.iter().enumerate(){let n=tails.partition_point(|t|candidates[*t].1<*bline);if n>0{prev[i]=Some(tails[n-1]);}if n==tails.len(){tails.push(i);}else{tails[n]=i;}}
         let mut anchors=Vec::new();let mut cursor=tails.last().copied();while let Some(i)=cursor{anchors.push(candidates[i]);cursor=prev[i];}anchors.reverse();
@@ -107,17 +111,29 @@ impl Comparison {
         let a_lines=lines(&a);let b_lines=lines(&b);Self{a,b,changes,coarse,a_lines,b_lines}
     }
     pub fn location(&self,index:usize,left:bool)->(usize,usize){
-        let text=if left{&self.a}else{&self.b};let c=&self.changes[index];let pos=if left{c.a.start}else{c.b.start};
+        let c=&self.changes[index];self.location_at(if left{c.a.start}else{c.b.start},left)
+    }
+    pub fn location_at(&self,pos:usize,left:bool)->(usize,usize){
+        let text=if left{&self.a}else{&self.b};
         let lines=if left{&self.a_lines}else{&self.b_lines};let line=lines.partition_point(|p|*p<=pos).saturating_sub(1);(line+1,text[lines[line]..pos].chars().count()+1)
     }
+    #[cfg(test)]
     pub fn view(&self,index:usize,left:bool,font:f32,fg:Color32,flash:bool)->(egui::text::LayoutJob,usize){
+        self.view_focus(index,left,font,fg,flash,None)
+    }
+    pub fn map_range(&self,range:Range<usize>,from_left:bool)->Range<usize>{
+        let map=|pos:usize|{let mut delta=0isize;for c in &self.changes{let(a,b)=if from_left{(&c.a,&c.b)}else{(&c.b,&c.a)};if pos<a.start{break;}if pos<a.end{return b.start;}delta=b.end as isize-a.end as isize;}(pos as isize+delta).max(0) as usize};
+        let text=if from_left{&self.b}else{&self.a};let mut start=map(range.start).min(text.len());while !text.is_char_boundary(start){start-=1;}let mut end=map(range.end).min(text.len()).max(start);while !text.is_char_boundary(end){end-=1;}start..end
+    }
+    pub fn view_focus(&self,index:usize,left:bool,font:f32,fg:Color32,flash:bool,focus:Option<Range<usize>>)->(egui::text::LayoutJob,usize){
         let text=if left{&self.a}else{&self.b};
-        let selected=self.changes.get(index).map(|c|if left{c.a.clone()}else{c.b.clone()}).unwrap_or(0..0);
+        let searching=focus.is_some();
+        let selected=focus.or_else(||self.changes.get(index).map(|c|if left{c.a.clone()}else{c.b.clone()})).unwrap_or(0..0);
         let start=text[..selected.start].char_indices().rev().nth(700).map_or(0,|(i,_)|i);
         let end=text[selected.start..].char_indices().nth(3500).map_or(text.len(),|(i,_)|selected.start+i);
         let mut job=egui::text::LayoutJob::default();let mut target=0;let mut display_chars=0;
         let mut change_idx=self.changes.partition_point(|c|{let r=if left{&c.a}else{&c.b};r.end<start});
-        let mut line_empty=text[..start].rsplit('\n').next().unwrap_or("").trim().is_empty();
+
         for(pos,ch)in text[start..end].char_indices().map(|(i,c)|(start+i,c)).chain(std::iter::once((end,'\0'))){
             if pos==selected.start{
                 target=display_chars;
@@ -127,8 +143,10 @@ impl Comparison {
             while change_idx<self.changes.len(){let r=if left{&self.changes[change_idx].a}else{&self.changes[change_idx].b};if r.end<=pos{change_idx+=1;}else{break;}}
             let changed=self.changes.get(change_idx).is_some_and(|c|{let r=if left{&c.a}else{&c.b};r.contains(&pos)});
             let active=selected.contains(&pos);
-            let display=match ch{'\n'=>{let s=if line_empty{"〔空白行〕↵\n"}else{"↵\n"};line_empty=true;s.to_string()},'\r'=>"␍".into(),'\t'=>"⇥".into(),_=>{if !ch.is_whitespace(){line_empty=false;}ch.to_string()}};
-            display_chars+=display.chars().count();job.append(&display,0.0,format(font,fg,changed,left,active,flash));
+            let display=match ch{'\n'=>{"↵\n".to_string()},'\r'=>"␍".into(),'\t'=>"⇥".into(),_=>{ch.to_string()}};
+            display_chars+=display.chars().count();let mut style=format(font,fg,changed||active,left,active,flash);
+            if searching&&active{style.background=Color32::from_rgb(255,220,80);style.strikethrough=egui::Stroke::NONE;}
+            job.append(&display,0.0,style);
         }
         if end<text.len(){job.append("\n…（後續文字省略；使用上一處／下一處定位）",0.0,format(font,fg,false,left,false,false));}
         (job,target)
@@ -145,7 +163,7 @@ fn format(font:f32,fg:Color32,changed:bool,left:bool,active:bool,flash:bool)->eg
         let c=Comparison::new("第一行甲\n共同第二行\n第三行乙\n".into(),"第一行丙\n共同第二行\n\n第三行丁\n".into());
         assert!(c.changes.len()>=3);assert_eq!(c.location(0,true),(1,4));
         let n=c.changes.iter().position(|h|c.b[h.b.clone()].contains('\n')&&h.a.is_empty()).unwrap();
-        let(view,_) =c.view(n,false,24.0,Color32::WHITE,true);assert!(view.text.contains("空白行"));assert!(view.text.contains('↵'));
+        let(view,_) =c.view(n,false,24.0,Color32::WHITE,true);assert!(!view.text.contains("空白行"));assert!(view.text.contains('↵'));
         assert_eq!(view.sections[0].format.font_id.size,24.0);
     }
     #[test]fn long_unchanged_text_does_not_become_a_change_after_insertion(){
@@ -161,5 +179,14 @@ fn format(font:f32,fg:Color32,changed:bool,left:bool,active:bool,flash:bool)->eg
         let common="共同段落，完全相同。\n".repeat(10000);
         let c=Comparison::new(format!("開頭甲\n{common}結尾甲"),format!("開頭乙\n{common}結尾乙"));
         assert_eq!(c.changes.len(),2);assert!(!c.coarse);
+    }
+}
+
+#[cfg(test)]mod repeated_separator_regression{
+    use super::*;
+    #[test]fn small_edits_with_repeated_separators_do_not_expand(){
+        let common=(0..200).map(|n|format!("\n==========\n\n第{n}章 獨立章名\n\n正文第{n}段\n")).collect::<String>();
+        let a=format!("作者1\n{common}結尾?\n");let b=format!("作者\n{common}結尾\n");
+        let c=Comparison::new(a,b);assert_eq!(c.changes.len(),2);
     }
 }

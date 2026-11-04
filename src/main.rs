@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod find;
 mod version_diff;
 mod writing;
 mod writing_store;
@@ -67,6 +68,26 @@ fn index(text: String, name: String) -> Book {
 
 fn display_text(text: &str) -> String {
     text.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n")
+}
+fn display_character_at(raw:&str,byte:usize)->usize{
+    let(mut offset,mut visible,mut seen)=(0,0,false);
+    for line in raw.split_inclusive('\n'){
+        let trimmed=line.trim();if !trimmed.is_empty(){
+            if seen{visible+=1;}seen=true;
+            let start=offset+line.len()-line.trim_start().len();let end=start+trimmed.len();
+            if byte<=start{return visible;}if byte<=end{return visible+raw[start..byte].chars().count();}visible+=trimmed.chars().count();
+        }offset+=line.len();
+    }visible
+}
+fn source_byte_at(raw:&str,character:usize)->usize{
+    let(mut offset,mut visible,mut seen)=(0,0,false);
+    for line in raw.split_inclusive('\n'){
+        let trimmed=line.trim();if !trimmed.is_empty(){
+            if seen{visible+=1;}seen=true;
+            let start=offset+line.len()-line.trim_start().len();let count=trimmed.chars().count();
+            if character<=visible+count{return start+trimmed.char_indices().nth(character.saturating_sub(visible)).map_or(trimmed.len(),|(i,_)|i);}visible+=count;
+        }offset+=line.len();
+    }raw.len()
 }
 impl Book {
     fn title_at(&self, page: usize) -> String {
@@ -194,6 +215,7 @@ fn paragraph_layout(galley:Arc<egui::Galley>,paragraph_gap:f32)->Arc<egui::Galle
 }
 
 struct Tab {
+    find:find::Find,find_hit:Option<find::Hit>,read_seek:Option<usize>,
     book:Option<Book>,
     page:usize,
     receiver:Option<mpsc::Receiver<Result<Book, String>>>,
@@ -211,12 +233,13 @@ struct Tab {
     writer:writing::Writer,
  }
 impl Tab {
-    fn new(root:PathBuf,prefs:writing::Preferences)->Self{Self{book:None,page:0,receiver:None,status:"開啟 TXT 或新增作品".into(),search:String::new(),matches:Vec::new(),jump:1,offset:0.0,read_chars:0,active_path:None,pending_path:None,character:0,row_offset:0.0,pending_anchor:None,writer:writing::Writer::new(root,prefs)}}
+    fn new(root:PathBuf,prefs:writing::Preferences)->Self{Self{find:Default::default(),find_hit:None,read_seek:None,book:None,page:0,receiver:None,status:"開啟 TXT 或新增作品".into(),search:String::new(),matches:Vec::new(),jump:1,offset:0.0,read_chars:0,active_path:None,pending_path:None,character:0,row_offset:0.0,pending_anchor:None,writer:writing::Writer::new(root,prefs)}}
     fn path(&self)->Option<&PathBuf>{if self.writer.preferences.enabled{self.writer.doc.as_ref().map(|d|&d.path).or(self.pending_path.as_ref())}else{self.active_path.as_ref().or(self.pending_path.as_ref())}}
     fn saved(&self)->Option<SavedTab>{self.path().map(|path|SavedTab{path:path.clone(),writing:self.writer.preferences.enabled,writing_page:self.writer.doc.as_ref().map_or(self.writer.preferences.page,|d|d.page),position:SavedBook{page:self.page,offset:self.offset,character:Some(self.character),row_offset:self.row_offset}})}
 }
 
 struct Reader {
+    find:find::Find,find_hit:Option<find::Hit>,read_seek:Option<usize>,
     files: Vec<PathBuf>, folder: PathBuf, book: Option<Book>, page: usize,
     receiver: Option<mpsc::Receiver<Result<Book, String>>>, status: String,
     search: String, matches: Vec<usize>, font: f32, font_choice: usize,
@@ -258,7 +281,7 @@ impl Reader {
             Err(e) => (LibraryState::default(), format!("閱讀紀錄讀取失敗：{e}")),
         };
         let writer = writing::Writer::new(state_path.with_file_name("writing-data"), state.writing.clone());
-        let mut app = Self { files: vec![], folder: state.folder.clone().unwrap_or_else(|| BOOKS.into()), book: None, page: 0, receiver: None, status: "滑鼠移到左邊或上邊開啟功能欄，選擇小說開始閱讀".into(), search: String::new(), matches: vec![], font: 24.0, font_choice: 2, background: Color32::from_rgb(246, 240, 225), foreground: Color32::from_rgb(48, 43, 37), spacing: Spacing::Paragraph, jump: 1, left_margin: 28.0, right_margin: 28.0, line_spacing: 1.45, paragraph_gap: 34.8, no_margins: false, read_chars: 0, offset: 0.0, strength: 1.0, pinned: false, top_visible: false, left_visible: false, state, state_path, active_path: None, pending_path: None, last_save: Instant::now(), saved_json: String::new(), state_readable: save_error.is_empty(), save_error, character: 0, row_offset: 0.0, pending_anchor: None, writer, appearance_open: false, tabs:vec![None],active_tab:0,closing_tab:None,closing_all:false,close_allowed:false };
+        let mut app = Self { find:Default::default(),find_hit:None,read_seek:None,files: vec![], folder: state.folder.clone().unwrap_or_else(|| BOOKS.into()), book: None, page: 0, receiver: None, status: "滑鼠移到左邊或上邊開啟功能欄，選擇小說開始閱讀".into(), search: String::new(), matches: vec![], font: 24.0, font_choice: 2, background: Color32::from_rgb(246, 240, 225), foreground: Color32::from_rgb(48, 43, 37), spacing: Spacing::Paragraph, jump: 1, left_margin: 28.0, right_margin: 28.0, line_spacing: 1.45, paragraph_gap: 34.8, no_margins: false, read_chars: 0, offset: 0.0, strength: 1.0, pinned: false, top_visible: false, left_visible: false, state, state_path, active_path: None, pending_path: None, last_save: Instant::now(), saved_json: String::new(), state_readable: save_error.is_empty(), save_error, character: 0, row_offset: 0.0, pending_anchor: None, writer, appearance_open: false, tabs:vec![None],active_tab:0,closing_tab:None,closing_all:false,close_allowed:false };
         app.apply_settings();
         app.refresh();
         let saved_tabs=app.state.tabs.clone();let saved_active=app.state.active_tab;
@@ -363,6 +386,7 @@ impl Reader {
             if ui.add_enabled(self.receiver.is_none() && !self.writer.busy(), egui::Button::new(if self.writer.preferences.enabled { "切回閱讀" } else { "寫作模式" })).clicked() {
                 if self.writer.preferences.enabled { self.writer.leave(ctx); }
                 else {
+                    self.writer.seek_after_open=self.book.as_ref().map(|book|book.pages[self.page]+source_byte_at(book.page(self.page),self.character));
                     self.writer.preferences.enabled = true;
                     if let Some(path)=self.active_path.clone().or_else(||self.writer.preferences.last.clone()) {self.writer.open(path,false,ctx);}
                     self.persist();
@@ -412,6 +436,7 @@ impl Reader {
 
     fn settings(&self)->Settings{Settings{font:self.font,font_choice:self.font_choice,background:self.background.to_array(),foreground:self.foreground.to_array(),spacing:self.spacing,strength:self.strength,pinned:self.pinned,left_margin:self.left_margin,right_margin:self.right_margin,line_spacing:self.line_spacing,paragraph_gap:self.paragraph_gap,no_margins:self.no_margins}}
     fn exchange(&mut self,tab:&mut Tab){
+        std::mem::swap(&mut self.read_seek,&mut tab.read_seek);std::mem::swap(&mut self.find,&mut tab.find);std::mem::swap(&mut self.find_hit,&mut tab.find_hit);
         std::mem::swap(&mut self.book,&mut tab.book);
         std::mem::swap(&mut self.page,&mut tab.page);
         std::mem::swap(&mut self.receiver,&mut tab.receiver);
@@ -505,6 +530,21 @@ impl Reader {
         }
         false
     }
+    fn locate_read(&mut self,byte:usize){
+        if let Some(book)=&self.book{let byte=byte.min(book.text.len());self.page=book.pages.partition_point(|p|*p<=byte).saturating_sub(1);let start=book.pages[self.page];let mut end=byte;while !book.text.is_char_boundary(end){end-=1;}
+            let character=display_character_at(book.page(self.page),end-start);self.character=character;self.offset=0.0;self.pending_anchor=Some((character,0.0));
+        }
+    }
+    fn find_ui(&mut self,ctx:&egui::Context){
+        self.find.shortcut(ctx);if !self.find.open{return;}
+        let writing=self.writer.preferences.enabled;let revision=self.writer.doc.as_ref().map_or(0,|d|d.revision);
+        if self.find.source(format!("{:?}/{writing}/{revision}",self.current_path())){self.find_hit=None;}
+        let mut hit=None;
+        egui::TopBottomPanel::top("find-bar").show(ctx,|ui|{
+            hit=self.find.ui(ui,||if writing{self.writer.doc.as_ref().map(|d|vec![d.chunks.clone()]).unwrap_or_default()}else{self.book.as_ref().map(|b|vec![vec![Arc::new(b.text.clone())]]).unwrap_or_default()});
+        });
+        if let Some(hit)=hit{if writing{self.writer.seek_byte(hit.range.clone());}else{self.locate_read(hit.range.start);}self.find_hit=Some(hit);}
+    }
     fn tabs_ui(&mut self,ctx:&egui::Context){
         let mut switch=None;let mut close=None;let mut open=None;let mut new=false;
         egui::TopBottomPanel::top("document-tabs").show(ctx,|ui|{
@@ -553,6 +593,8 @@ impl Reader {
             self.writer.read_ready = false; self.writer.preferences.enabled = false;
             if let Some(doc) = &self.writer.doc {
                 let chunks = doc.chunks.clone(); let path = doc.path.clone();
+                let byte=self.writer.byte_position();
+                self.read_seek=Some(byte);
                 self.pending_path = Some(path.clone()); self.book = None;
                 let (tx,rx)=mpsc::channel(); self.receiver=Some(rx); let ctx=ctx.clone();
                 std::thread::spawn(move|| { let text=chunks.iter().map(|s|s.as_str()).collect::<String>(); let _=tx.send(Ok(index(text,path.file_name().unwrap_or_default().to_string_lossy().into())));ctx.request_repaint(); });
@@ -566,7 +608,7 @@ impl Reader {
                     match result {
                         Ok(book) => {
                             self.status = format!("{:.1} MB · {} 個章節項目 · 載入 {:.2} 秒", book.text.len() as f64 / 1048576.0, book.chapters.len(), book.seconds);
-                            self.book = Some(book); self.active_path = self.pending_path.take(); self.restore(); self.search.clear(); self.filter();
+                            self.book = Some(book); self.active_path = self.pending_path.take(); self.restore();if let Some(byte)=self.read_seek.take(){self.locate_read(byte);} self.search.clear(); self.filter();
                         }
                         Err(e) => self.status = format!("無法開啟：{e}"),
                     }
@@ -575,6 +617,7 @@ impl Reader {
                 Err(mpsc::TryRecvError::Empty) => { ctx.request_repaint_after(std::time::Duration::from_millis(100)); }
             }
         }
+        self.find_ui(ctx);
         let mut open = None;
         let pointer = ctx.input(|i| i.pointer.hover_pos());
         let popup = ctx.memory(|m| m.any_popup_open());
@@ -696,6 +739,19 @@ impl Reader {
                     let galley = get(page);
                     let end = galley.cursor_from_pos(egui::vec2(width, rect.bottom() - y));
                     read = book.read_count(page, end.ccursor.index);
+                    if let Some(hit)=self.find_hit.as_ref().filter(|_|self.find.open){
+                        let start=book.pages[page];let end=book.pages.get(page+1).copied().unwrap_or(book.text.len());
+                        if hit.range.start<end&&hit.range.end>start{
+                            let a=display_character_at(book.page(page),hit.range.start.max(start)-start);let b=display_character_at(book.page(page),hit.range.end.min(end)-start);
+                            let ca=galley.from_ccursor(egui::text::CCursor::new(a));let cb=galley.from_ccursor(egui::text::CCursor::new(b));
+                            let ra=galley.pos_from_cursor(&ca);let rb=galley.pos_from_cursor(&cb);
+                            for row in &galley.rows{if row.rect.bottom()>=ra.top()&&row.rect.top()<=rb.bottom(){
+                                let left=if row.rect.top()<=ra.top()&&row.rect.bottom()>=ra.top(){ra.left()}else{row.rect.left()};
+                                let right=if row.rect.top()<=rb.top()&&row.rect.bottom()>=rb.top(){rb.left()}else{row.rect.right()};
+                                painter.rect_filled(egui::Rect::from_min_max(egui::pos2(rect.left()+left,y+row.rect.top()),egui::pos2(rect.left()+right.max(left+3.0),y+row.rect.bottom())),0.0,Color32::from_rgba_unmultiplied(220,160,20,100));
+                            }}
+                        }
+                    }
                     painter.galley_with_override_text_color(egui::pos2(rect.left(), y), galley.clone(), self.foreground);
                     y += galley.size().y.max(self.font * self.line_spacing) + if book.page(page).ends_with('\n') { self.paragraph_gap } else { 0.0 };
                     page += 1;
@@ -938,3 +994,5 @@ mod tests {
     }
 
 }
+
+#[cfg(test)]mod search_position_tests{use super::*;#[test]fn source_display_positions_keep_line_breaks(){let raw="  首行  \n\n  下一行🙂\n";let byte=raw.find("下一行").unwrap();let character=display_character_at(raw,byte);assert_eq!(character,3);assert_eq!(source_byte_at(raw,character),byte);}}
