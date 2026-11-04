@@ -434,6 +434,7 @@ impl Reader {
         if index==self.active_tab||index>=self.tabs.len(){return;}
         let mut next=self.tabs[index].take().expect("inactive tab");
         next.writer.preferences.autosave_secs=self.writer.preferences.autosave_secs;next.writer.preferences.limit_mib=self.writer.preferences.limit_mib;
+        next.writer.preferences.compare_left=self.writer.preferences.compare_left;next.writer.preferences.compare_right=self.writer.preferences.compare_right;
         self.exchange(&mut next);self.tabs[self.active_tab]=Some(next);self.active_tab=index;
         self.appearance_open=false;self.pending_anchor=Some((self.character,self.row_offset));
     }
@@ -468,8 +469,9 @@ impl Reader {
     fn tick_tabs(&mut self,ctx:&egui::Context)->bool{
         self.writer.tick(ctx,!self.closing_all&&self.closing_tab.is_none());
         let seconds=self.writer.preferences.autosave_secs;let limit=self.writer.preferences.limit_mib;
+        let margins=(self.writer.preferences.compare_left,self.writer.preferences.compare_right);
         for tab in self.tabs.iter_mut().flatten(){
-            tab.writer.preferences.autosave_secs=seconds;tab.writer.preferences.limit_mib=limit;tab.writer.tick(ctx,false);
+            tab.writer.preferences.autosave_secs=seconds;tab.writer.preferences.limit_mib=limit;tab.writer.preferences.compare_left=margins.0;tab.writer.preferences.compare_right=margins.1;tab.writer.tick(ctx,false);
             if tab.writer.read_ready{
                 tab.writer.read_ready=false;tab.writer.preferences.enabled=false;
                 if let Some(doc)=&tab.writer.doc{
