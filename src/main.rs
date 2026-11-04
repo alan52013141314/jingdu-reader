@@ -95,7 +95,10 @@ struct SavedBook {
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
-struct LibraryState { last: Option<PathBuf>, folder: Option<PathBuf>, books: BTreeMap<String, SavedBook>, settings: Option<Settings>, format_version: u32, writing: writing::Preferences }
+struct LibraryState { tabs: Vec<SavedTab>, active_tab:usize, last: Option<PathBuf>, folder: Option<PathBuf>, books: BTreeMap<String, SavedBook>, settings: Option<Settings>, format_version: u32, writing: writing::Preferences }
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SavedTab {path:PathBuf, writing:bool, writing_page:usize, position:SavedBook}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -125,7 +128,7 @@ fn load_state(bytes: &[u8]) -> Result<LibraryState, serde_json::Error> {
         // Keep its block/pixel position instead of reusing incompatible character offsets.
         for book in state.books.values_mut() { book.character = None; }
     }
-    state.format_version = 2;
+    state.format_version = state.format_version.max(2);
     Ok(state)
 }
 fn reading_margins(width: f32, left: f32, right: f32) -> (f32, f32) {
@@ -170,7 +173,10 @@ fn layout_page(book: &Book, page: usize, width: f32, font: f32, line_spacing: f3
     job.wrap.max_width = width;
     let display = display_text(book.page(page));
     job.append(&display, 0.0, egui::TextFormat { font_id: egui::FontId::proportional(font), color: Color32::WHITE, line_height: Some(font * line_spacing), ..Default::default() });
-    let mut galley = (*ctx.fonts(|f| f.layout_job(job))).clone();
+    paragraph_layout(ctx.fonts(|f| f.layout_job(job)),paragraph_gap)
+}
+fn paragraph_layout(galley:Arc<egui::Galley>,paragraph_gap:f32)->Arc<egui::Galley>{
+    let mut galley=(*galley).clone();
     let mut shift = 0.0;
     let mut bounds = egui::Rect::NOTHING;
     for row in &mut galley.rows {
@@ -187,6 +193,29 @@ fn layout_page(book: &Book, page: usize, width: f32, font: f32, line_spacing: f3
     Arc::new(galley)
 }
 
+struct Tab {
+    book:Option<Book>,
+    page:usize,
+    receiver:Option<mpsc::Receiver<Result<Book, String>>>,
+    status:String,
+    search:String,
+    matches:Vec<usize>,
+    jump:usize,
+    offset:f32,
+    read_chars:usize,
+    active_path:Option<PathBuf>,
+    pending_path:Option<PathBuf>,
+    character:usize,
+    row_offset:f32,
+    pending_anchor:Option<(usize,f32)>,
+    writer:writing::Writer,
+ }
+impl Tab {
+    fn new(root:PathBuf,prefs:writing::Preferences)->Self{Self{book:None,page:0,receiver:None,status:"開啟 TXT 或新增作品".into(),search:String::new(),matches:Vec::new(),jump:1,offset:0.0,read_chars:0,active_path:None,pending_path:None,character:0,row_offset:0.0,pending_anchor:None,writer:writing::Writer::new(root,prefs)}}
+    fn path(&self)->Option<&PathBuf>{if self.writer.preferences.enabled{self.writer.doc.as_ref().map(|d|&d.path).or(self.pending_path.as_ref())}else{self.active_path.as_ref().or(self.pending_path.as_ref())}}
+    fn saved(&self)->Option<SavedTab>{self.path().map(|path|SavedTab{path:path.clone(),writing:self.writer.preferences.enabled,writing_page:self.writer.doc.as_ref().map_or(self.writer.preferences.page,|d|d.page),position:SavedBook{page:self.page,offset:self.offset,character:Some(self.character),row_offset:self.row_offset}})}
+}
+
 struct Reader {
     files: Vec<PathBuf>, folder: PathBuf, book: Option<Book>, page: usize,
     receiver: Option<mpsc::Receiver<Result<Book, String>>>, status: String,
@@ -198,6 +227,7 @@ struct Reader {
     last_save: Instant, saved_json: String, save_error: String, state_readable: bool,
     character: usize, row_offset: f32, pending_anchor: Option<(usize, f32)>,
     writer: writing::Writer, appearance_open: bool,
+    tabs:Vec<Option<Tab>>,active_tab:usize,closing_tab:Option<usize>,closing_all:bool,close_allowed:bool,
 }
 
 impl Reader {
@@ -207,24 +237,46 @@ impl Reader {
             fonts.font_data.insert("chinese".into(), egui::FontData::from_owned(bytes).into());
             fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap().insert(0, "chinese".into());
         }
+        if let Ok(bytes)=std::fs::read("C:/Windows/Fonts/seguisym.ttf"){
+            fonts.font_data.insert("symbols".into(),egui::FontData::from_owned(bytes).into());
+            fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap().push("symbols".into());
+        }
         cc.egui_ctx.set_fonts(fonts);
         cc.egui_ctx.set_visuals(egui::Visuals::light());
         let mut style = (*cc.egui_ctx.style()).clone();
         for id in style.text_styles.values_mut() { id.size = 16.0; }
         style.spacing.button_padding = egui::vec2(10.0, 6.0);
         cc.egui_ctx.set_style(style);
-        let state_path = std::env::current_exe().unwrap_or_default().with_file_name("reader-state.json");
+        let mut app=Self::from_path(cc.egui_ctx.clone(),std::env::current_exe().unwrap_or_default().with_file_name("reader-state.json"));
+        if let Some(path)=std::env::args_os().nth(1).map(PathBuf::from){app.open_tab(path,false,false,&cc.egui_ctx);}
+        app
+    }
+    fn from_path(ctx:egui::Context,state_path:PathBuf)->Self{
         let (state, save_error) = match std::fs::read(&state_path) {
             Ok(bytes) => match load_state(&bytes) { Ok(s) => (s, String::new()), Err(e) => (LibraryState::default(), format!("閱讀紀錄無法解析：{e}")) },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (LibraryState::default(), String::new()),
             Err(e) => (LibraryState::default(), format!("閱讀紀錄讀取失敗：{e}")),
         };
         let writer = writing::Writer::new(state_path.with_file_name("writing-data"), state.writing.clone());
-        let mut app = Self { files: vec![], folder: state.folder.clone().unwrap_or_else(|| BOOKS.into()), book: None, page: 0, receiver: None, status: "滑鼠移到左邊或上邊開啟功能欄，選擇小說開始閱讀".into(), search: String::new(), matches: vec![], font: 24.0, font_choice: 2, background: Color32::from_rgb(246, 240, 225), foreground: Color32::from_rgb(48, 43, 37), spacing: Spacing::Paragraph, jump: 1, left_margin: 28.0, right_margin: 28.0, line_spacing: 1.45, paragraph_gap: 34.8, no_margins: false, read_chars: 0, offset: 0.0, strength: 1.0, pinned: false, top_visible: false, left_visible: false, state, state_path, active_path: None, pending_path: None, last_save: Instant::now(), saved_json: String::new(), state_readable: save_error.is_empty(), save_error, character: 0, row_offset: 0.0, pending_anchor: None, writer, appearance_open: false };
+        let mut app = Self { files: vec![], folder: state.folder.clone().unwrap_or_else(|| BOOKS.into()), book: None, page: 0, receiver: None, status: "滑鼠移到左邊或上邊開啟功能欄，選擇小說開始閱讀".into(), search: String::new(), matches: vec![], font: 24.0, font_choice: 2, background: Color32::from_rgb(246, 240, 225), foreground: Color32::from_rgb(48, 43, 37), spacing: Spacing::Paragraph, jump: 1, left_margin: 28.0, right_margin: 28.0, line_spacing: 1.45, paragraph_gap: 34.8, no_margins: false, read_chars: 0, offset: 0.0, strength: 1.0, pinned: false, top_visible: false, left_visible: false, state, state_path, active_path: None, pending_path: None, last_save: Instant::now(), saved_json: String::new(), state_readable: save_error.is_empty(), save_error, character: 0, row_offset: 0.0, pending_anchor: None, writer, appearance_open: false, tabs:vec![None],active_tab:0,closing_tab:None,closing_all:false,close_allowed:false };
         app.apply_settings();
         app.refresh();
-        let startup = std::env::args_os().nth(1).map(PathBuf::from).or_else(|| if app.writer.preferences.enabled { app.writer.preferences.last.clone().or_else(|| app.state.last.clone()) } else { app.state.last.clone() });
-        if let Some(path) = startup { app.open(path, cc.egui_ctx.clone()); }
+        let saved_tabs=app.state.tabs.clone();let saved_active=app.state.active_tab;
+        if saved_tabs.is_empty() && app.state.format_version<3{
+            let startup=app.state.last.clone();
+            let writing=app.writer.preferences.enabled;
+            let startup=if writing{app.writer.preferences.last.clone().or(startup)}else{startup};
+            if let Some(path)=startup{app.open_tab(path,writing,false,&ctx);}
+        }else if !saved_tabs.is_empty(){
+            for saved in saved_tabs{
+                app.state.books.insert(key(&saved.path),saved.position.clone());
+                app.open_tab(saved.path.clone(),saved.writing,false,&ctx);
+                app.writer.preferences.page=saved.writing_page;app.writer.preferences.last=Some(saved.path);
+                app.page=saved.position.page;app.offset=saved.position.offset;app.character=saved.position.character.unwrap_or(0);app.row_offset=saved.position.row_offset;
+            }
+            app.switch_tab(saved_active.min(app.tabs.len()-1));
+        }
+
         app
     }
 
@@ -246,10 +298,13 @@ impl Reader {
             self.state.books.insert(key(path), SavedBook { page: self.page, offset: self.offset, character: Some(self.character), row_offset: self.row_offset });
             self.state.last = Some(path.clone());
         }
+        self.state.tabs=(0..self.tabs.len()).filter_map(|i|if i==self.active_tab{self.saved_active()}else{self.tabs[i].as_ref().and_then(Tab::saved)}).collect();
+        self.state.active_tab=self.active_tab.min(self.state.tabs.len().saturating_sub(1));
+        for saved in &self.state.tabs{self.state.books.insert(key(&saved.path),saved.position.clone());}
         self.state.writing = self.writer.preferences.clone();
         self.state.settings = Some(Settings { font: self.font, font_choice: self.font_choice, background: self.background.to_array(), foreground: self.foreground.to_array(), spacing: self.spacing, strength: self.strength, pinned: self.pinned, left_margin: self.left_margin, right_margin: self.right_margin, line_spacing: self.line_spacing, paragraph_gap: self.paragraph_gap, no_margins: self.no_margins });
         self.state.folder = Some(self.folder.clone());
-        self.state.format_version = 2;
+        self.state.format_version = 3;
         let json = serde_json::to_string(&self.state).unwrap_or_default();
         if json != self.saved_json {
             match save_state(&self.state_path, &self.state) {
@@ -280,10 +335,9 @@ impl Reader {
         }
     }
 
-    fn open(&mut self, path: PathBuf, ctx: egui::Context) {
+    fn load_document(&mut self, path: PathBuf, ctx: egui::Context) {
         if self.writer.preferences.enabled { self.writer.open(path, false, &ctx); return; }
         if self.receiver.is_some() { return; }
-        self.persist();
         self.active_path = None;
         self.pending_path = Some(path.clone());
         self.status = format!("背景讀取及分章：{}", path.file_name().unwrap_or_default().to_string_lossy());
@@ -315,7 +369,16 @@ impl Reader {
                 }
             }
             if ui.add_enabled(self.receiver.is_none() && !self.writer.busy(), egui::Button::new("開啟 TXT")).clicked() { open=rfd::FileDialog::new().add_filter("文字檔", &["txt"]).set_directory(&self.folder).pick_file(); }
-            if self.writer.preferences.enabled { self.writer.toolbar(ui,ctx); }
+            if self.writer.preferences.enabled {
+                if ui.add_enabled(!self.writer.busy(),egui::Button::new("新建")).clicked(){self.choose_new_tab(ctx);}
+                self.writer.toolbar(ui,ctx);
+                if ui.add_enabled(!self.writer.busy()&&self.writer.doc.is_some(),egui::Button::new("另存")).clicked(){
+                    if let Some(path)=rfd::FileDialog::new().add_filter("文字檔", &["txt"]).save_file(){
+                        if self.find_tab(&path).is_some_and(|i|i!=self.active_tab){self.writer.message="此文件已在另一分頁開啟，請選擇其他名稱".into();}
+                        else{self.writer.save_as_to(path,ctx);}
+                    }
+                }
+            }
             ui.menu_button("書架",|ui|{
                 if ui.button("選擇資料夾").clicked(){if let Some(p)=rfd::FileDialog::new().set_directory(&self.folder).pick_folder(){self.folder=p;self.refresh();}ui.close_menu();}
                 if ui.button("重新整理").clicked(){self.refresh();ui.close_menu();}
@@ -347,6 +410,120 @@ impl Reader {
             }
     }
 
+    fn settings(&self)->Settings{Settings{font:self.font,font_choice:self.font_choice,background:self.background.to_array(),foreground:self.foreground.to_array(),spacing:self.spacing,strength:self.strength,pinned:self.pinned,left_margin:self.left_margin,right_margin:self.right_margin,line_spacing:self.line_spacing,paragraph_gap:self.paragraph_gap,no_margins:self.no_margins}}
+    fn exchange(&mut self,tab:&mut Tab){
+        std::mem::swap(&mut self.book,&mut tab.book);
+        std::mem::swap(&mut self.page,&mut tab.page);
+        std::mem::swap(&mut self.receiver,&mut tab.receiver);
+        std::mem::swap(&mut self.status,&mut tab.status);
+        std::mem::swap(&mut self.search,&mut tab.search);
+        std::mem::swap(&mut self.matches,&mut tab.matches);
+        std::mem::swap(&mut self.jump,&mut tab.jump);
+        std::mem::swap(&mut self.offset,&mut tab.offset);
+        std::mem::swap(&mut self.read_chars,&mut tab.read_chars);
+        std::mem::swap(&mut self.active_path,&mut tab.active_path);
+        std::mem::swap(&mut self.pending_path,&mut tab.pending_path);
+        std::mem::swap(&mut self.character,&mut tab.character);
+        std::mem::swap(&mut self.row_offset,&mut tab.row_offset);
+        std::mem::swap(&mut self.pending_anchor,&mut tab.pending_anchor);
+        std::mem::swap(&mut self.writer,&mut tab.writer);
+    }
+    fn current_path(&self)->Option<&PathBuf>{if self.writer.preferences.enabled{self.writer.doc.as_ref().map(|d|&d.path).or(self.pending_path.as_ref())}else{self.active_path.as_ref().or(self.pending_path.as_ref())}}
+    fn saved_active(&self)->Option<SavedTab>{self.current_path().map(|path|SavedTab{path:path.clone(),writing:self.writer.preferences.enabled,writing_page:self.writer.doc.as_ref().map_or(self.writer.preferences.page,|d|d.page),position:SavedBook{page:self.page,offset:self.offset,character:Some(self.character),row_offset:self.row_offset}})}
+    fn switch_tab(&mut self,index:usize){
+        if index==self.active_tab||index>=self.tabs.len(){return;}
+        let mut next=self.tabs[index].take().expect("inactive tab");
+        next.writer.preferences.autosave_secs=self.writer.preferences.autosave_secs;next.writer.preferences.limit_mib=self.writer.preferences.limit_mib;
+        self.exchange(&mut next);self.tabs[self.active_tab]=Some(next);self.active_tab=index;
+        self.appearance_open=false;self.pending_anchor=Some((self.character,self.row_offset));
+    }
+    fn find_tab(&self,path:&Path)->Option<usize>{let identity=key(path);(0..self.tabs.len()).find(|i|{let p=if *i==self.active_tab{self.current_path()}else{self.tabs[*i].as_ref().and_then(Tab::path)};p.is_some_and(|p|key(p)==identity)})}
+    fn open_tab(&mut self,path:PathBuf,writing:bool,create:bool,ctx:&egui::Context){
+        if let Some(i)=self.find_tab(&path){self.switch_tab(i);return;}
+        if self.current_path().is_some(){
+            let mut prefs=self.writer.preferences.clone();prefs.enabled=writing;prefs.last=None;prefs.page=0;
+            let mut empty=Tab::new(self.state_path.with_file_name("writing-data"),prefs);
+            self.exchange(&mut empty);self.tabs[self.active_tab]=Some(empty);self.active_tab=self.tabs.len();self.tabs.push(None);
+        }else{self.writer.preferences.enabled=writing;}
+        self.pending_path=Some(path.clone());
+        if let Some(saved)=self.state.books.get(&key(&path)){self.page=saved.page;self.offset=saved.offset;self.character=saved.character.unwrap_or(0);self.row_offset=saved.row_offset;}
+        if writing{self.writer.open(path,create,ctx);}else{self.load_document(path,ctx.clone());}
+    }
+    fn choose_new_tab(&mut self,ctx:&egui::Context){if let Some(path)=rfd::FileDialog::new().add_filter("文字檔", &["txt"]).set_file_name("新作品.txt").save_file(){self.open_tab(path,true,true,ctx);}}
+    fn close_tab(&mut self,index:usize,ctx:&egui::Context){
+        if self.closing_tab.is_some()||self.closing_all{return;}
+        self.closing_tab=Some(index);
+        if index==self.active_tab{self.writer.request_close(ctx);}else if let Some(tab)=&mut self.tabs[index]{tab.writer.request_close(ctx);}
+    }
+    fn remove_tab(&mut self,index:usize){
+        if self.tabs.len()==1{
+            let mut prefs=self.writer.preferences.clone();prefs.enabled=false;prefs.last=None;prefs.page=0;
+            let mut empty=Tab::new(self.state_path.with_file_name("writing-data"),prefs);self.exchange(&mut empty);
+        }else{
+            if index==self.active_tab{self.switch_tab(if index==0{1}else{index-1});}
+            self.tabs.remove(index);if self.active_tab>index{self.active_tab-=1;}
+        }
+        self.closing_tab=None;self.persist();
+    }
+    fn tick_tabs(&mut self,ctx:&egui::Context)->bool{
+        self.writer.tick(ctx,!self.closing_all&&self.closing_tab.is_none());
+        let seconds=self.writer.preferences.autosave_secs;let limit=self.writer.preferences.limit_mib;
+        for tab in self.tabs.iter_mut().flatten(){
+            tab.writer.preferences.autosave_secs=seconds;tab.writer.preferences.limit_mib=limit;tab.writer.tick(ctx,false);
+            if tab.writer.read_ready{
+                tab.writer.read_ready=false;tab.writer.preferences.enabled=false;
+                if let Some(doc)=&tab.writer.doc{
+                    let chunks=doc.chunks.clone();let path=doc.path.clone();tab.pending_path=Some(path.clone());tab.book=None;
+                    let(tx,rx)=mpsc::channel();tab.receiver=Some(rx);let ctx=ctx.clone();
+                    std::thread::spawn(move||{let text=chunks.iter().map(|s|s.as_str()).collect::<String>();let _=tx.send(Ok(index(text,path.file_name().unwrap_or_default().to_string_lossy().into())));ctx.request_repaint();});
+                }
+            }
+        }
+        if ctx.input(|i|i.viewport().close_requested())&&!self.close_allowed{
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if !self.closing_all{
+                self.closing_all=true;self.closing_tab=None;
+                self.writer.request_close(ctx);for tab in self.tabs.iter_mut().flatten(){tab.writer.request_close(ctx);}
+            }
+        }
+        if self.closing_all{
+            let failed=self.writer.close_failed||self.tabs.iter().flatten().any(|t|t.writer.close_failed);
+            if failed{
+                self.closing_all=false;self.writer.allow_close=false;
+                for t in self.tabs.iter_mut().flatten(){t.writer.allow_close=false;}
+                if let Some(index)=self.tabs.iter().position(|t|t.as_ref().is_some_and(|t|t.writer.close_failed)){self.switch_tab(index);}
+                self.status="保存失敗，程式保持開啟；請檢查錯誤後再關閉".into();
+            }else if self.writer.allow_close&&self.tabs.iter().flatten().all(|t|t.writer.allow_close){
+                self.persist();self.close_allowed=true;ctx.send_viewport_cmd(egui::ViewportCommand::Close);return true;
+            }
+        }
+        if let Some(index)=self.closing_tab{
+            let writer=if index==self.active_tab{&self.writer}else{&self.tabs[index].as_ref().unwrap().writer};
+            if writer.close_failed{self.closing_tab=None;self.switch_tab(index);}else if writer.allow_close{self.remove_tab(index);}
+        }
+        false
+    }
+    fn tabs_ui(&mut self,ctx:&egui::Context){
+        let mut switch=None;let mut close=None;let mut open=None;let mut new=false;
+        egui::TopBottomPanel::top("document-tabs").show(ctx,|ui|{
+            ui.add_enabled_ui(!self.closing_all&&self.closing_tab.is_none(),|ui|{
+                egui::ScrollArea::horizontal().show(ui,|ui|{ui.horizontal(|ui|{
+                    for i in 0..self.tabs.len(){
+                        let(path,writing)=if i==self.active_tab{(self.current_path(),self.writer.preferences.enabled)}else{let t=self.tabs[i].as_ref().unwrap();(t.path(),t.writer.preferences.enabled)};
+                        let name=path.and_then(|p|p.file_name()).map(|n|n.to_string_lossy().into_owned()).unwrap_or_else(||"未開啟".into());
+                        if ui.selectable_label(i==self.active_tab,format!("{} · {name}",if writing{"寫作"}else{"閱讀"})).clicked(){switch=Some(i);}
+                        if ui.small_button("×").on_hover_text("關閉此分頁；寫作模式會先儲存").clicked(){close=Some(i);}
+                        ui.separator();
+                    }
+                    if ui.button("＋ 開啟").clicked(){open=rfd::FileDialog::new().add_filter("文字檔", &["txt"]).pick_file();}
+                    if ui.button("＋ 新作品").clicked(){new=true;}
+                });});
+            });
+            if self.closing_all||self.closing_tab.is_some(){ui.label("正在保存寫作分頁，完成後關閉…");}
+        });
+        if let Some(i)=switch{self.switch_tab(i);}if let Some(i)=close{self.close_tab(i,ctx);}if let Some(p)=open{self.open_tab(p,false,false,ctx);}if new{self.choose_new_tab(ctx);}
+    }
+
     fn filter(&mut self) {
         let query = self.search.trim().to_lowercase();
         self.matches = self.book.as_ref().map(|b| b.chapters.iter().enumerate().filter(|(_, c)| query.is_empty() || c.title.to_lowercase().contains(&query)).map(|(i, _)| i).collect()).unwrap_or_default();
@@ -355,8 +532,21 @@ impl Reader {
 
 impl eframe::App for Reader {
     fn on_exit(&mut self, _: Option<&eframe::glow::Context>) { self.persist(); }
-    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        self.writer.tick(ctx);
+    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {self.ui(ctx);}
+}
+impl Reader {
+    fn ui(&mut self,ctx:&egui::Context){
+        if self.tick_tabs(ctx){return;}
+        if self.writer.history_open{
+            let settings=self.settings();self.writer.history_ui(ctx,&settings);
+            if self.last_save.elapsed().as_secs_f32()>=1.0{self.persist();}
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));return;
+        }
+        if self.closing_all||self.closing_tab.is_some(){
+            egui::CentralPanel::default().show(ctx,|ui|{ui.heading("正在保存分頁…");ui.label("完成後自動關閉；失敗時保持開啟。");});
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));return;
+        }
+        self.tabs_ui(ctx);
         if self.writer.read_ready {
             self.writer.read_ready = false; self.writer.preferences.enabled = false;
             if let Some(doc) = &self.writer.doc {
@@ -386,12 +576,12 @@ impl eframe::App for Reader {
         let mut open = None;
         let pointer = ctx.input(|i| i.pointer.hover_pos());
         let popup = ctx.memory(|m| m.any_popup_open());
-        self.top_visible = self.pinned || popup || pointer.is_some_and(|p| p.y < if self.top_visible { 80.0 } else { 18.0 });
+        self.top_visible = self.pinned || popup || pointer.is_some_and(|p| p.y < if self.top_visible { 80.0 } else { 65.0 });
         self.left_visible = self.pinned || pointer.is_some_and(|p| p.x < if self.left_visible { 290.0 } else { 18.0 });
         if self.pinned {
             egui::TopBottomPanel::top("toolbar-dock").show(ctx, |ui| { open = self.toolbar(ui,ctx); });
         } else if self.top_visible {
-            egui::Window::new("toolbar-hover").title_bar(false).resizable(false).fixed_pos([0.0,0.0]).show(ctx, |ui| { open = self.toolbar(ui,ctx); });
+            egui::Window::new("toolbar-hover").title_bar(false).resizable(false).fixed_pos([0.0,38.0]).show(ctx, |ui| { open = self.toolbar(ui,ctx); });
         }
         if self.appearance_open {
             let mut show = true;
@@ -514,10 +704,9 @@ impl eframe::App for Reader {
                 ui.painter().text(rect.min, egui::Align2::LEFT_TOP, &self.status, egui::FontId::proportional(22.0), self.foreground);
             }
         });
-        self.writer.history_ui(ctx);
         if self.last_save.elapsed().as_secs_f32() >= 1.0 { self.persist(); }
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
-        if let Some(path) = open { self.open(path, ctx.clone()); }
+        if let Some(path) = open { self.open_tab(path,false,false,ctx); }
     }
 }
 
@@ -692,4 +881,58 @@ mod tests {
         assert_eq!((0..b.pages.len()).map(|p| b.page(p).len()).sum::<usize>(), bytes);
         println!("{bytes} bytes, {} pages, {n} chapters, {:.3}s including generation and validation", b.pages.len(), start.elapsed().as_secs_f64());
     }
+}
+
+#[cfg(test)]mod tab_tests{
+    use super::*;
+    fn setup()->(PathBuf,egui::Context,Reader){
+        let root=PathBuf::from("verification").join(format!("tabs-{}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&root).unwrap();let path=root.join("reader-state.json");
+        save_state(&path,&LibraryState{folder:Some(root.clone()),..Default::default()}).unwrap();
+        let ctx=egui::Context::default();let reader=Reader::from_path(ctx.clone(),path);(root,ctx,reader)
+    }
+    fn pump(app:&mut Reader,ctx:&egui::Context,done:impl Fn(&Reader)->bool){
+        let start=Instant::now();while !done(app)&&start.elapsed().as_secs()<10{
+            let _=ctx.run(Default::default(),|ctx|app.ui(ctx));std::thread::sleep(std::time::Duration::from_millis(10));
+        }assert!(done(app),"background task timed out: {}",app.writer.message);
+    }
+    #[test]fn tabs_keep_modes_positions_and_drafts_across_restart(){
+        let(root,ctx,mut app)=setup();let a=root.join("a.txt");let b=root.join("b.txt");
+        std::fs::write(&a,"第一章 測試\n正文".repeat(1000)).unwrap();std::fs::write(&b,"原本寫作").unwrap();
+        app.open_tab(a.clone(),false,false,&ctx);pump(&mut app,&ctx,|a|a.book.is_some());app.page=2;app.character=3;app.offset=15.0;
+        app.open_tab(b.clone(),true,false,&ctx);pump(&mut app,&ctx,|a|a.writer.doc.is_some());
+        {let d=app.writer.doc.as_mut().unwrap();d.chunks=writing_store::split("尚未手動儲存");d.revision+=1;d.dirty=true;}
+        app.writer.preferences.autosave_secs=5;
+        app.switch_tab(0);assert!(!app.writer.preferences.enabled);assert_eq!(app.page,2);
+        // Inactive writing tabs continue to auto-save, while their original file remains unchanged.
+        pump(&mut app,&ctx,|a|a.tabs[1].as_ref().unwrap().writer.doc.as_ref().unwrap().drafted_revision==1);
+        assert_eq!(std::fs::read_to_string(&b).unwrap(),"原本寫作");
+        app.persist();let state_path=app.state_path.clone();drop(app);
+        let mut app=Reader::from_path(ctx.clone(),state_path);assert_eq!(app.tabs.len(),2);assert_eq!(app.active_tab,0);
+        pump(&mut app,&ctx,|a|a.book.is_some());assert_eq!(app.page,2);
+        app.switch_tab(1);pump(&mut app,&ctx,|a|a.writer.doc.is_some());assert!(app.writer.preferences.enabled);assert_eq!(app.writer.doc.as_ref().unwrap().chunks[0].as_str(),"尚未手動儲存");
+        app.open_tab(b.clone(),false,false,&ctx);assert_eq!(app.tabs.len(),2);assert!(app.writer.preferences.enabled);
+        app.close_tab(1,&ctx);pump(&mut app,&ctx,|a|a.tabs.len()==1);assert_eq!(std::fs::read_to_string(b).unwrap(),"尚未手動儲存");assert!(!app.writer.preferences.enabled);
+        app.close_tab(0,&ctx);pump(&mut app,&ctx,|a|a.current_path().is_none());let path=app.state_path.clone();drop(app);
+        let app=Reader::from_path(ctx,path);assert!(app.current_path().is_none());
+    }
+    #[test]fn failed_close_keeps_dirty_tab_and_other_document(){
+        let(root,ctx,mut app)=setup();let path=root.join("book.txt");std::fs::write(&path,"original").unwrap();
+        app.open_tab(path.clone(),true,false,&ctx);pump(&mut app,&ctx,|a|a.writer.doc.is_some());
+        let d=app.writer.doc.as_mut().unwrap();d.chunks=writing_store::split("recover me");d.dirty=true;d.revision+=1;d.path=path.join("invalid.txt");
+        app.close_tab(0,&ctx);pump(&mut app,&ctx,|a|a.closing_tab.is_none());
+        assert!(app.writer.close_failed);assert_eq!(app.tabs.len(),1);assert_eq!(app.writer.doc.as_ref().unwrap().chunks[0].as_str(),"recover me");assert_eq!(std::fs::read_to_string(path).unwrap(),"original");
+    }
+    #[test]fn application_close_saves_all_writing_tabs_and_remembers_them(){
+        let(root,ctx,mut app)=setup();
+        for name in ["one.txt","two.txt"]{
+            let path=root.join(name);std::fs::write(&path,"original").unwrap();app.open_tab(path,true,false,&ctx);
+            pump(&mut app,&ctx,|a|a.writer.doc.is_some());let d=app.writer.doc.as_mut().unwrap();d.chunks=writing_store::split(name);d.dirty=true;d.revision+=1;
+        }
+        let mut input=egui::RawInput::default();input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().events.push(egui::ViewportEvent::Close);
+        let _=ctx.run(input,|ctx|app.ui(ctx));pump(&mut app,&ctx,|a|a.close_allowed);
+        for name in ["one.txt","two.txt"]{assert_eq!(std::fs::read_to_string(root.join(name)).unwrap(),name);}
+        let state=load_state(&std::fs::read(&app.state_path).unwrap()).unwrap();assert_eq!(state.tabs.len(),2);assert!(state.tabs.iter().all(|t|t.writing));
+    }
+
 }
